@@ -41,6 +41,11 @@ module Dalli
     # - :compressor - defaults to Dalli::Compressor, a Zlib-based implementation
     # - :cache_nils - defaults to false, if true Dalli will not treat cached nil values as 'not found' for
     #                 #fetch operations.
+    # - :raw        - If set, disables serialization and compression entirely at the client level.
+    #                 Only String values are supported. This is useful when the caller handles its own
+    #                 serialization (e.g., Rails' ActiveSupport::Cache). Note: this is different from
+    #                 the per-request :raw option which converts values to strings but still uses the
+    #                 serialization pipeline.
     # - :digest_class - defaults to Digest::MD5, allows you to pass in an object that responds to the hexdigest method,
     #                   useful for injecting a FIPS compliant hash object.
     # - :protocol - one of either :binary or :meta, defaulting to :binary.  This sets the protocol that Dalli uses
@@ -56,6 +61,7 @@ module Dalli
 
       @key_manager = ::Dalli::KeyManager.new(@options)
       @ring = nil
+      emit_deprecation_warnings
     end
 
     #
@@ -97,23 +103,69 @@ module Dalli
     end
 
     ##
+    # Get value with extended metadata using the meta protocol.
+    #
+    # IMPORTANT: This method requires memcached 1.6+ and the meta protocol (protocol: :meta).
+    # It will raise an error if used with the binary protocol.
+    #
+    # @param key [String] the cache key
+    # @param options [Hash] options controlling what metadata to return
+    #   - :return_cas [Boolean] return the CAS value (default: true)
+    #   - :return_hit_status [Boolean] return whether item was previously accessed
+    #   - :return_last_access [Boolean] return seconds since last access
+    #   - :skip_lru_bump [Boolean] don't bump LRU or update access stats
+    #
+    # @return [Hash] containing:
+    #   - :value - the cached value (or nil on miss)
+    #   - :cas - the CAS value
+    #   - :hit_before - true/false if previously accessed (only if return_hit_status: true)
+    #   - :last_access - seconds since last access (only if return_last_access: true)
+    #
+    # @example Get with hit status
+    #   result = client.get_with_metadata('key', return_hit_status: true)
+    #   # => { value: "data", cas: 123, hit_before: true }
+    #
+    # @example Get with all metadata without affecting LRU
+    #   result = client.get_with_metadata('key',
+    #     return_hit_status: true,
+    #     return_last_access: true,
+    #     skip_lru_bump: true
+    #   )
+    #   # => { value: "data", cas: 123, hit_before: true, last_access: 42 }
+    #
+    def get_with_metadata(key, options = {})
+      raise_unless_meta_protocol!
+
+      key = key.to_s
+      key = @key_manager.validate_key(key)
+
+      Instrumentation.trace('get_with_metadata', { 'db.operation' => 'get_with_metadata' }) do
+        server = ring.server_for_key(key)
+        server.request(:meta_get, key, options)
+      end
+    rescue NetworkError => e
+      Dalli.logger.debug { e.inspect }
+      Dalli.logger.debug { 'retrying get_with_metadata with new server' }
+      retry
+    end
+
+    ##
     # Fetch multiple keys efficiently.
     # If a block is given, yields key/value pairs one at a time.
     # Otherwise returns a hash of { 'key' => 'value', 'key2' => 'value1' }
+    # rubocop:disable Style/ExplicitBlockArgument
     def get_multi(*keys)
       keys.flatten!
       keys.compact!
-
       return {} if keys.empty?
 
       if block_given?
-        pipelined_getter.process(keys) { |k, data| yield k, data.first }
+        get_multi_yielding(keys) { |k, v| yield k, v }
       else
-        {}.tap do |hash|
-          pipelined_getter.process(keys) { |k, data| hash[k] = data.first }
-        end
+        get_multi_hash(keys)
       end
     end
+    # rubocop:enable Style/ExplicitBlockArgument
 
     ##
     # Fetch multiple keys efficiently, including available metadata such as CAS.
@@ -150,6 +202,56 @@ module Dalli
     end
 
     ##
+    # Fetch the value with thundering herd protection using the meta protocol's
+    # N (vivify) and R (recache) flags.
+    #
+    # This method prevents multiple clients from simultaneously regenerating the same
+    # cache entry (the "thundering herd" problem). Only one client wins the right to
+    # regenerate; other clients receive the stale value (if available) or wait.
+    #
+    # IMPORTANT: This method requires memcached 1.6+ and the meta protocol (protocol: :meta).
+    # It will raise an error if used with the binary protocol.
+    #
+    # @param key [String] the cache key
+    # @param ttl [Integer] time-to-live for the cached value in seconds
+    # @param lock_ttl [Integer] how long the lock/stub lives (default: 30 seconds)
+    #   This is the maximum time other clients will return stale data while
+    #   waiting for regeneration. Should be longer than your expected regeneration time.
+    # @param recache_threshold [Integer, nil] if set, win the recache race when the
+    #   item's remaining TTL is below this threshold. Useful for proactive recaching.
+    # @param req_options [Hash] options passed to set operations (e.g., raw: true)
+    #
+    # @yield Block to regenerate the value (only called if this client won the race)
+    # @return [Object] the cached value (may be stale if another client is regenerating)
+    #
+    # @example Basic usage
+    #   client.fetch_with_lock('expensive_key', ttl: 300, lock_ttl: 30) do
+    #     expensive_database_query
+    #   end
+    #
+    # @example With proactive recaching (recache before expiry)
+    #   client.fetch_with_lock('key', ttl: 300, lock_ttl: 30, recache_threshold: 60) do
+    #     expensive_operation
+    #   end
+    #
+    def fetch_with_lock(key, ttl: nil, lock_ttl: 30, recache_threshold: nil, req_options: nil, &block)
+      raise ArgumentError, 'Block is required for fetch_with_lock' unless block_given?
+
+      raise_unless_meta_protocol!
+
+      key = key.to_s
+      key = @key_manager.validate_key(key)
+
+      Instrumentation.trace('fetch_with_lock', { 'db.operation' => 'fetch_with_lock' }) do
+        fetch_with_lock_request(key, ttl, lock_ttl, recache_threshold, req_options, &block)
+      end
+    rescue NetworkError => e
+      Dalli.logger.debug { e.inspect }
+      Dalli.logger.debug { 'retrying fetch_with_lock with new server' }
+      retry
+    end
+
+    ##
     # compare and swap values using optimistic locking.
     # Fetch the existing value for key.
     # If it exists, yield the value to the block.
@@ -160,8 +262,8 @@ module Dalli
     # - nil if the key did not exist.
     # - false if the value was changed by someone else.
     # - true if the value was successfully updated.
-    def cas(key, ttl = nil, req_options = nil, &block)
-      cas_core(key, false, ttl, req_options, &block)
+    def cas(key, ttl = nil, req_options = nil, &)
+      cas_core(key, false, ttl, req_options, &)
     end
 
     ##
@@ -171,8 +273,8 @@ module Dalli
     # Returns:
     # - false if the value was changed by someone else.
     # - true if the value was successfully updated.
-    def cas!(key, ttl = nil, req_options = nil, &block)
-      cas_core(key, true, ttl, req_options, &block)
+    def cas!(key, ttl = nil, req_options = nil, &)
+      cas_core(key, true, ttl, req_options, &)
     end
 
     ##
@@ -204,6 +306,29 @@ module Dalli
 
     def set(key, value, ttl = nil, req_options = nil)
       set_cas(key, value, 0, ttl, req_options)
+    end
+
+    ##
+    # Set multiple keys and values efficiently using pipelining.
+    # This method is more efficient than calling set() in a loop because
+    # it batches requests by server and uses quiet mode.
+    #
+    # @param hash [Hash] key-value pairs to set
+    # @param ttl [Integer] time-to-live in seconds (optional, uses default if not provided)
+    # @param req_options [Hash] options passed to each set operation
+    # @return [void]
+    #
+    # Example:
+    #   client.set_multi({ 'key1' => 'value1', 'key2' => 'value2' }, 300)
+    def set_multi(hash, ttl = nil, req_options = nil)
+      return if hash.empty?
+
+      Instrumentation.trace('set_multi', {
+                              'db.operation' => 'set_multi',
+                              'db.memcached.key_count' => hash.size
+                            }) do
+        pipelined_setter.process(hash, ttl_or_default(ttl), req_options)
+      end
     end
 
     ##
@@ -243,6 +368,27 @@ module Dalli
 
     def delete(key)
       delete_cas(key, 0)
+    end
+
+    ##
+    # Delete multiple keys efficiently using pipelining.
+    # This method is more efficient than calling delete() in a loop because
+    # it batches requests by server and uses quiet mode.
+    #
+    # @param keys [Array<String>] keys to delete
+    # @return [void]
+    #
+    # Example:
+    #   client.delete_multi(['key1', 'key2', 'key3'])
+    def delete_multi(keys)
+      return if keys.empty?
+
+      Instrumentation.trace('delete_multi', {
+                              'db.operation' => 'delete_multi',
+                              'db.memcached.key_count' => keys.size
+                            }) do
+        pipelined_deleter.process(keys)
+      end
     end
 
     ##
@@ -374,6 +520,42 @@ module Dalli
 
     private
 
+    # Records hit/miss metrics on a span for cache observability.
+    # @param span [OpenTelemetry::Trace::Span, nil] the span to record on
+    # @param key_count [Integer] total keys requested
+    # @param hit_count [Integer] keys found in cache
+    def record_hit_miss_metrics(span, key_count, hit_count)
+      return unless span
+
+      span.set_attribute('db.memcached.hit_count', hit_count)
+      span.set_attribute('db.memcached.miss_count', key_count - hit_count)
+    end
+
+    def get_multi_yielding(keys)
+      Instrumentation.trace_with_result('get_multi', get_multi_attributes(keys)) do |span|
+        hit_count = 0
+        pipelined_getter.process(keys) do |k, data|
+          hit_count += 1
+          yield k, data.first
+        end
+        record_hit_miss_metrics(span, keys.size, hit_count)
+        nil
+      end
+    end
+
+    def get_multi_hash(keys)
+      Instrumentation.trace_with_result('get_multi', get_multi_attributes(keys)) do |span|
+        {}.tap do |hash|
+          pipelined_getter.process(keys) { |k, data| hash[k] = data.first }
+          record_hit_miss_metrics(span, keys.size, hash.size)
+        end
+      end
+    end
+
+    def get_multi_attributes(keys)
+      { 'db.operation' => 'get_multi', 'db.memcached.key_count' => keys.size }
+    end
+
     def check_positive!(amt)
       raise ArgumentError, "Positive values only: #{amt}" if amt.negative?
     end
@@ -384,6 +566,17 @@ module Dalli
 
       newvalue = yield(value)
       perform(:set, key, newvalue, ttl_or_default(ttl), cas, req_options)
+    end
+
+    def fetch_with_lock_request(key, ttl, lock_ttl, recache_threshold, req_options)
+      server = ring.server_for_key(key)
+      result = server.request(:meta_get, key, { vivify_ttl: lock_ttl, recache_ttl: recache_threshold })
+
+      return result[:value] unless result[:won_recache]
+
+      new_val = yield
+      set(key, new_val, ttl_or_default(ttl), req_options)
+      new_val
     end
 
     ##
@@ -428,7 +621,12 @@ module Dalli
       key = @key_manager.validate_key(key)
 
       server = ring.server_for_key(key)
-      server.request(op, key, *args)
+      Instrumentation.trace(op.to_s, {
+                              'db.operation' => op.to_s,
+                              'server.address' => server.name
+                            }) do
+        server.request(op, key, *args)
+      end
     rescue NetworkError => e
       Dalli.logger.debug { e.inspect }
       Dalli.logger.debug { 'retrying request with new server' }
@@ -445,5 +643,23 @@ module Dalli
     def pipelined_getter
       PipelinedGetter.new(ring, @key_manager)
     end
+
+    def pipelined_setter
+      PipelinedSetter.new(ring, @key_manager)
+    end
+
+    def pipelined_deleter
+      PipelinedDeleter.new(ring, @key_manager)
+    end
+
+    def raise_unless_meta_protocol!
+      return if protocol_implementation == Dalli::Protocol::Meta
+
+      raise Dalli::DalliError,
+            'This operation requires the meta protocol (memcached 1.6+). ' \
+            'Use protocol: :meta when creating the client.'
+    end
+
+    include ProtocolDeprecations
   end
 end

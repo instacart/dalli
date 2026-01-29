@@ -4,8 +4,6 @@
 # Namespace for all Dalli code.
 ##
 module Dalli
-  autoload :Server, 'dalli/server'
-
   # generic error
   class DalliError < RuntimeError; end
 
@@ -29,6 +27,9 @@ module Dalli
 
   # operation is not permitted in a multi block
   class NotPermittedMultiOpError < DalliError; end
+
+  # raised when Memcached response with a SERVER_ERROR
+  class ServerError < DalliError; end
 
   # Implements the NullObject pattern to store an application-defined value for 'Key not found' responses.
   class NilObject; end # rubocop:disable Lint/EmptyClass
@@ -58,11 +59,15 @@ module Dalli
 end
 
 require_relative 'dalli/version'
+require_relative 'dalli/instrumentation'
 
 require_relative 'dalli/compressor'
+require_relative 'dalli/protocol_deprecations'
 require_relative 'dalli/client'
 require_relative 'dalli/key_manager'
 require_relative 'dalli/pipelined_getter'
+require_relative 'dalli/pipelined_setter'
+require_relative 'dalli/pipelined_deleter'
 require_relative 'dalli/ring'
 require_relative 'dalli/protocol'
 require_relative 'dalli/protocol/base'
@@ -74,6 +79,7 @@ require_relative 'dalli/protocol/server_config_parser'
 require_relative 'dalli/protocol/ttl_sanitizer'
 require_relative 'dalli/protocol/value_compressor'
 require_relative 'dalli/protocol/value_marshaller'
+require_relative 'dalli/protocol/string_marshaller'
 require_relative 'dalli/protocol/value_serializer'
 require_relative 'dalli/servers_arg_normalizer'
 require_relative 'dalli/socket'

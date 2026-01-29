@@ -18,29 +18,50 @@ module Dalli
       # https://www.hjp.at/zettel/m/memcached_flags.rxml
       # Looks like most clients use bit 0 to indicate native language serialization
       FLAG_SERIALIZED = 0x1
+      FLAG_UTF8 = 0x2
+
+      # Class variable to track whether the Marshal warning has been logged
+      @@marshal_warning_logged = false # rubocop:disable Style/ClassVars
 
       attr_accessor :serialization_options
 
       def initialize(protocol_options)
         @serialization_options =
-          DEFAULTS.merge(protocol_options.select { |k, _| OPTIONS.include?(k) })
+          DEFAULTS.merge(protocol_options.slice(*OPTIONS))
+        warn_if_marshal_default(protocol_options) unless protocol_options[:silence_marshal_warning]
       end
 
       def store(value, req_options, bitflags)
-        do_serialize = !(req_options && req_options[:raw])
-        store_value = do_serialize ? serialize_value(value) : value.to_s
-        bitflags |= FLAG_SERIALIZED if do_serialize
-        [store_value, bitflags]
+        if req_options
+          return [value.to_s, bitflags] if req_options[:raw]
+
+          # If the value is a simple string, going through serialization is costly
+          # for no benefit other than preserving encoding.
+          # Assuming most strings are either UTF-8 or BINARY we can just store
+          # that information in the bitflags.
+          if req_options[:string_fastpath] && value.instance_of?(String)
+            case value.encoding
+            when Encoding::BINARY
+              return [value, bitflags]
+            when Encoding::UTF_8
+              return [value, bitflags | FLAG_UTF8]
+            end
+          end
+        end
+
+        [serialize_value(value), bitflags | FLAG_SERIALIZED]
       end
 
       def retrieve(value, bitflags)
-        serialized = (bitflags & FLAG_SERIALIZED) != 0
+        serialized = bitflags.anybits?(FLAG_SERIALIZED)
         if serialized
           begin
             serializer.load(value)
           rescue StandardError
             raise UnmarshalError, 'Unable to unmarshal value'
           end
+        elsif bitflags.anybits?(FLAG_UTF8)
+          value.force_encoding(Encoding::UTF_8)
         else
           value
         end
@@ -60,6 +81,19 @@ module Dalli
         exc = Dalli::MarshalError.new(e.message)
         exc.set_backtrace e.backtrace
         raise exc
+      end
+
+      private
+
+      def warn_if_marshal_default(protocol_options)
+        return if protocol_options.key?(:serializer)
+        return if @@marshal_warning_logged
+
+        Dalli.logger.warn 'SECURITY WARNING: Dalli is using Marshal for serialization. ' \
+                          'Marshal can execute arbitrary code during deserialization. ' \
+                          'If your memcached server could be compromised, consider using ' \
+                          'a safer serializer like JSON: Dalli::Client.new(servers, serializer: JSON)'
+        @@marshal_warning_logged = true # rubocop:disable Style/ClassVars
       end
     end
   end

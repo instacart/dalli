@@ -74,6 +74,24 @@ describe 'Network' do
           end
         end
 
+        it 'handles operation timeouts' do
+          next if p == :binary
+
+          memcached_mock(lambda { |sock|
+            # handle initial version call
+            sock.gets
+            sock.write("VERSION 1.6.0\r\n")
+
+            sleep(0.3)
+          }) do
+            dc = Dalli::Client.new('localhost:19123', socket_timeout: 0.1, protocol: p, socket_max_failures: 0,
+                                                      socket_failure_delay: 0.0, down_retry_delay: 0.0)
+            assert_raises Dalli::RingError, message: 'No server available' do
+              dc.get('abc')
+            end
+          end
+        end
+
         it 'opens a standard TCP connection when ssl_context is not configured' do
           memcached_persistent(p) do |dc|
             server = dc.send(:ring).servers.first
@@ -118,12 +136,89 @@ describe 'Network' do
             refute_equal(optval[0], 0)
           end
         end
+
+        it 'fails when SSL client connects to non-SSL server' do
+          memcached_persistent(p) do |_, port|
+            ssl_context = OpenSSL::SSL::SSLContext.new
+            ssl_context.verify_mode = OpenSSL::SSL::VERIFY_NONE
+
+            dc = Dalli::Client.new("localhost:#{port}", ssl_context: ssl_context)
+
+            # SSL handshake fails when connecting to a non-SSL server
+            assert_raises OpenSSL::SSL::SSLError do
+              dc.get('abc')
+            end
+          end
+        end
+
+        it 'fails when SSL verification fails due to untrusted certificate' do
+          memcached_ssl_persistent(p) do |_, port|
+            # Create SSL context that does not trust the test CA
+            strict_ssl_context = OpenSSL::SSL::SSLContext.new
+            strict_ssl_context.verify_mode = OpenSSL::SSL::VERIFY_PEER
+            # Don't set ca_file, so the self-signed cert won't be trusted
+
+            dc = Dalli::Client.new("localhost:#{port}", ssl_context: strict_ssl_context)
+
+            # SSL verification fails due to untrusted certificate
+            assert_raises OpenSSL::SSL::SSLError do
+              dc.get('abc')
+            end
+          end
+        end
       end
 
       it 'handles timeout error during pipelined get' do
         with_nil_logger do
           memcached(p, 19_191) do |dc|
             dc.send(:ring).server_for_key('abc').sock.stub(:write, proc { raise Timeout::Error }) do
+              assert_empty dc.get_multi(['abc'])
+            end
+          end
+        end
+      end
+
+      it 'handles SSL error during read operations' do
+        with_nil_logger do
+          memcached(p, 19_191) do |dc|
+            # First set a value so we have something to get
+            dc.set('ssl_test_key', 'test_value')
+
+            server = dc.send(:ring).server_for_key('ssl_test_key')
+
+            # Stub error_on_request! to verify SSLError triggers error handling
+            # This confirms the SSL error is caught by the rescue clause
+            error_handled = false
+            original_error_on_request = server.instance_variable_get(:@connection_manager).method(:error_on_request!)
+
+            server.instance_variable_get(:@connection_manager).define_singleton_method(:error_on_request!) do |err|
+              error_handled = true if err.is_a?(OpenSSL::SSL::SSLError)
+              original_error_on_request.call(err)
+            end
+
+            ssl_error = OpenSSL::SSL::SSLError.new('SSL_read: unexpected eof while reading')
+
+            # Binary protocol uses readfull for reading, meta protocol uses gets
+            stub_method = p == :binary ? :readfull : :gets
+            server.sock.stub(stub_method, proc { raise ssl_error }) do
+              # The operation will retry with a new connection and may succeed
+              # What matters is the SSLError is caught, not propagated
+              dc.get('ssl_test_key')
+            rescue Dalli::NetworkError
+              # Expected if retries exhausted
+            end
+
+            assert error_handled, 'SSLError should trigger error_on_request!'
+          end
+        end
+      end
+
+      it 'handles SSL error during pipelined get' do
+        with_nil_logger do
+          memcached(p, 19_191) do |dc|
+            ssl_error = OpenSSL::SSL::SSLError.new('SSL_read: unexpected eof while reading')
+
+            dc.send(:ring).server_for_key('abc').sock.stub(:write, proc { raise ssl_error }) do
               assert_empty dc.get_multi(['abc'])
             end
           end
@@ -357,6 +452,21 @@ describe 'Network' do
           assert_instance_of Hash, resp
 
           dc.close
+        end
+      end
+    end
+  end
+
+  if MemcachedManager.supported_protocols.include?(:meta)
+    describe 'ServerError' do
+      it 'is raised when Memcached response with a SERVER_ERROR' do
+        memcached_mock(->(sock) { sock.write("SERVER_ERROR foo bar\r\n") }) do
+          dc = Dalli::Client.new('localhost:19123', protocol: :meta)
+          err = assert_raises Dalli::ServerError do
+            dc.get('abc')
+          end
+
+          assert_equal 'SERVER_ERROR foo bar', err.message
         end
       end
     end

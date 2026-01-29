@@ -52,7 +52,7 @@ module Dalli
 
       FILTERED_OUT_OPTIONS = %i[username password].freeze
       def logged_options
-        options.reject { |k, _| FILTERED_OUT_OPTIONS.include? k }
+        options.except(*FILTERED_OUT_OPTIONS)
       end
     end
 
@@ -63,6 +63,7 @@ module Dalli
     ##
     class SSLSocket < ::OpenSSL::SSL::SSLSocket
       include Dalli::Socket::InstanceMethods
+
       def options
         io.options
       end
@@ -85,6 +86,7 @@ module Dalli
     ##
     class TCP < TCPSocket
       include Dalli::Socket::InstanceMethods
+
       # options - supports enhanced logging in the case of a timeout
       attr_accessor :options
 
@@ -117,19 +119,33 @@ module Dalli
       end
 
       def self.init_socket_options(sock, options)
+        configure_tcp_options(sock, options)
+        configure_socket_buffers(sock, options)
+        configure_timeout(sock, options)
+      end
+
+      def self.configure_tcp_options(sock, options)
         sock.setsockopt(::Socket::IPPROTO_TCP, ::Socket::TCP_NODELAY, true)
         sock.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_KEEPALIVE, true) if options[:keepalive]
+      end
+
+      def self.configure_socket_buffers(sock, options)
         sock.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_RCVBUF, options[:rcvbuf]) if options[:rcvbuf]
         sock.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_SNDBUF, options[:sndbuf]) if options[:sndbuf]
+      end
 
+      def self.configure_timeout(sock, options)
         return unless options[:socket_timeout]
 
-        seconds, fractional = options[:socket_timeout].divmod(1)
-        microseconds = fractional * 1_000_000
-        timeval = [seconds, microseconds].pack('l_2')
+        if sock.respond_to?(:timeout=)
+          sock.timeout = options[:socket_timeout]
+        else
+          seconds, fractional = options[:socket_timeout].divmod(1)
+          timeval = [seconds, fractional * 1_000_000].pack('l_2')
 
-        sock.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_RCVTIMEO, timeval)
-        sock.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_SNDTIMEO, timeval)
+          sock.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_RCVTIMEO, timeval)
+          sock.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_SNDTIMEO, timeval)
+        end
       end
 
       def self.wrapping_ssl_socket(tcp_socket, host, ssl_context)
@@ -168,8 +184,15 @@ module Dalli
           Timeout.timeout(options[:socket_timeout]) do
             sock = new(path)
             sock.options = { path: path }.merge(options)
+            init_socket_options(sock, options)
             sock
           end
+        end
+
+        def self.init_socket_options(sock, options)
+          # https://man7.org/linux/man-pages/man7/unix.7.html
+          sock.setsockopt(::Socket::SOL_SOCKET, ::Socket::SO_SNDBUF, options[:sndbuf]) if options[:sndbuf]
+          sock.timeout = options[:socket_timeout] if options[:socket_timeout] && sock.respond_to?(:timeout=)
         end
       end
     end

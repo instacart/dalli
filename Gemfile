@@ -5,9 +5,18 @@ source 'https://rubygems.org'
 gemspec
 
 group :development, :test do
+  gem 'benchmark'
+  gem 'cgi'
   gem 'connection_pool'
-  gem 'minitest', '~> 5'
-  gem 'rack', '~> 2.0', '>= 2.2.0'
+  gem 'debug' unless RUBY_PLATFORM == 'java'
+  if RUBY_VERSION >= '3.2'
+    gem 'minitest', '~> 6'
+    gem 'minitest-mock'
+  else
+    gem 'minitest', '~> 5'
+  end
+  gem 'rack', '~> 3'
+  gem 'rack-session'
   gem 'rake', '~> 13.0'
   gem 'rubocop'
   gem 'rubocop-minitest'

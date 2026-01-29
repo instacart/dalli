@@ -11,8 +11,75 @@ Dalli supports:
 * Thread-safe operation (either through use of a connection pool, or by using the Dalli client in threadsafe mode)
 * SSL/TLS connections to memcached
 * SASL authentication
+* OpenTelemetry distributed tracing (automatic when SDK is present)
 
 The name is a variant of Salvador Dali for his famous painting [The Persistence of Memory](http://en.wikipedia.org/wiki/The_Persistence_of_Memory).
+
+## Requirements
+
+* Ruby 3.1 or later
+* memcached 1.4 or later (1.6+ recommended for meta protocol support)
+
+## Protocol Options
+
+Dalli supports two protocols for communicating with memcached:
+
+* `:binary` (default) - Works with all memcached versions, supports SASL authentication
+* `:meta` - Requires memcached 1.6+, better performance for some operations, no authentication support
+
+```ruby
+Dalli::Client.new('localhost:11211', protocol: :meta)
+```
+
+## Security Note
+
+By default, Dalli uses Ruby's Marshal for serialization. Deserializing untrusted data with Marshal can lead to remote code execution. If you cache user-controlled data, consider using a safer serializer:
+
+```ruby
+Dalli::Client.new('localhost:11211', serializer: JSON)
+```
+
+See the [4.0-Upgrade.md](4.0-Upgrade.md) guide for more information.
+
+## OpenTelemetry Tracing
+
+Dalli automatically instruments operations with [OpenTelemetry](https://opentelemetry.io/) when the SDK is present. No configuration is required - just add the OpenTelemetry gems to your application:
+
+```ruby
+# Gemfile
+gem 'opentelemetry-sdk'
+gem 'opentelemetry-exporter-otlp' # or your preferred exporter
+```
+
+When OpenTelemetry is loaded, Dalli creates spans for:
+- Single key operations: `get`, `set`, `delete`, `add`, `replace`, `incr`, `decr`, etc.
+- Multi-key operations: `get_multi`, `set_multi`, `delete_multi`
+- Advanced operations: `get_with_metadata`, `fetch_with_lock`
+
+### Span Attributes
+
+All spans include:
+- `db.system`: `memcached`
+- `db.operation`: The operation name (e.g., `get`, `set_multi`)
+
+Single-key operations also include:
+- `server.address`: The memcached server that handled the request (e.g., `localhost:11211`)
+
+Multi-key operations include cache efficiency metrics:
+- `db.memcached.key_count`: Number of keys in the request
+- `db.memcached.hit_count`: Number of keys found (for `get_multi`)
+- `db.memcached.miss_count`: Number of keys not found (for `get_multi`)
+
+### Error Handling
+
+Exceptions are automatically recorded on spans with error status. When an operation fails:
+1. The exception is recorded on the span via `span.record_exception(e)`
+2. The span status is set to error with the exception message
+3. The exception is re-raised to the caller
+
+### Zero Overhead
+
+When OpenTelemetry is not present, there is zero overhead - the tracing code checks once at startup and bypasses all instrumentation logic entirely when the SDK is not loaded.
 
 ![Persistence of Memory](https://upload.wikimedia.org/wikipedia/en/d/dd/The_Persistence_of_Memory.jpg)
 

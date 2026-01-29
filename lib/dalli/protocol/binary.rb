@@ -22,6 +22,7 @@ module Dalli
       def get(key, options = nil)
         req = RequestFormatter.standard_request(opkey: :get, key: key)
         write(req)
+        @connection_manager.flush
         response_processor.get(cache_nils: cache_nils?(options))
       end
 
@@ -41,12 +42,14 @@ module Dalli
         ttl = TtlSanitizer.sanitize(ttl)
         req = RequestFormatter.standard_request(opkey: :gat, key: key, ttl: ttl)
         write(req)
+        @connection_manager.flush
         response_processor.get(cache_nils: cache_nils?(options))
       end
 
       def touch(key, ttl)
         ttl = TtlSanitizer.sanitize(ttl)
         write(RequestFormatter.standard_request(opkey: :touch, key: key, ttl: ttl))
+        @connection_manager.flush
         response_processor.generic_response
       end
 
@@ -55,6 +58,7 @@ module Dalli
       def cas(key)
         req = RequestFormatter.standard_request(opkey: :get, key: key)
         write(req)
+        @connection_manager.flush
         response_processor.data_cas_response
       end
 
@@ -62,6 +66,12 @@ module Dalli
       def set(key, value, ttl, cas, options)
         opkey = quiet? ? :setq : :set
         storage_req(opkey, key, value, ttl, cas, options)
+      end
+
+      # Pipelined set - writes a quiet set request without reading response.
+      # Used by PipelinedSetter for bulk operations.
+      def pipelined_set(key, value, ttl, options)
+        storage_req(:setq, key, value, ttl, 0, options)
       end
 
       def add(key, value, ttl, options)
@@ -83,6 +93,7 @@ module Dalli
                                                 value: value, bitflags: bitflags,
                                                 ttl: ttl, cas: cas)
         write(req)
+        @connection_manager.flush unless quiet?
         response_processor.storage_response unless quiet?
       end
       # rubocop:enable Metrics/ParameterLists
@@ -99,6 +110,7 @@ module Dalli
 
       def write_append_prepend(opkey, key, value)
         write(RequestFormatter.standard_request(opkey: opkey, key: key, value: value))
+        @connection_manager.flush unless quiet?
         response_processor.no_body_response unless quiet?
       end
 
@@ -107,7 +119,15 @@ module Dalli
         opkey = quiet? ? :deleteq : :delete
         req = RequestFormatter.standard_request(opkey: opkey, key: key, cas: cas)
         write(req)
+        @connection_manager.flush unless quiet?
         response_processor.delete unless quiet?
+      end
+
+      # Pipelined delete - writes a quiet delete request without reading response.
+      # Used by PipelinedDeleter for bulk operations.
+      def pipelined_delete(key)
+        req = RequestFormatter.standard_request(opkey: :deleteq, key: key, cas: 0)
+        write(req)
       end
 
       # Arithmetic Commands
@@ -127,12 +147,14 @@ module Dalli
       # if the key doesn't already exist, rather than
       # setting the initial value
       NOT_FOUND_EXPIRY = 0xFFFFFFFF
+      private_constant :NOT_FOUND_EXPIRY
 
       def decr_incr(opkey, key, count, ttl, initial)
         expiry = initial ? TtlSanitizer.sanitize(ttl) : NOT_FOUND_EXPIRY
         initial ||= 0
         write(RequestFormatter.decr_incr_request(opkey: opkey, key: key,
                                                  count: count, initial: initial, expiry: expiry))
+        @connection_manager.flush unless quiet?
         response_processor.decr_incr unless quiet?
       end
 
@@ -140,6 +162,7 @@ module Dalli
       def flush(ttl = 0)
         opkey = quiet? ? :flushq : :flush
         write(RequestFormatter.standard_request(opkey: opkey, ttl: ttl))
+        @connection_manager.flush unless quiet?
         response_processor.no_body_response unless quiet?
       end
 
@@ -153,22 +176,26 @@ module Dalli
       def stats(info = '')
         req = RequestFormatter.standard_request(opkey: :stat, key: info)
         write(req)
+        @connection_manager.flush
         response_processor.stats
       end
 
       def reset_stats
         write(RequestFormatter.standard_request(opkey: :stat, key: 'reset'))
+        @connection_manager.flush
         response_processor.reset
       end
 
       def version
         write(RequestFormatter.standard_request(opkey: :version))
+        @connection_manager.flush
         response_processor.version
       end
 
       def write_noop
         req = RequestFormatter.standard_request(opkey: :noop)
         write(req)
+        @connection_manager.flush
       end
 
       require_relative 'binary/request_formatter'

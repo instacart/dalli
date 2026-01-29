@@ -1,10 +1,81 @@
 Dalli Changelog
 =====================
 
-Unreleased
+4.2.0
 ==========
 
+Performance:
+
+- Buffered I/O: Use `socket.sync = false` with explicit flush to reduce syscalls for pipelined operations
+- get_multi optimizations: Use Set for O(1) server tracking lookups
+- Raw mode optimization: Skip bitflags request in meta protocol when in raw mode (saves 2 bytes per request)
+
+New Features:
+
+- OpenTelemetry tracing support: Automatically instruments operations when OpenTelemetry SDK is present
+  - Zero overhead when OpenTelemetry is not loaded
+  - Traces `get`, `set`, `delete`, `get_multi`, `set_multi`, `delete_multi`, `get_with_metadata`, and `fetch_with_lock`
+  - Spans include `db.system: memcached` and `db.operation` attributes
+  - Single-key operations include `server.address` attribute
+  - Multi-key operations include `db.memcached.key_count` attribute
+  - `get_multi` spans include `db.memcached.hit_count` and `db.memcached.miss_count` for cache efficiency metrics
+  - Exceptions are automatically recorded on spans with error status
+
+4.1.0
+==========
+
+New Features:
+
+- Add `set_multi` for efficient bulk set operations using pipelined requests
+- Add `delete_multi` for efficient bulk delete operations using pipelined requests
+- Add `fetch_with_lock` for thundering herd protection using meta protocol's vivify/recache flags (requires memcached 1.6+)
+- Add thundering herd protection support to meta protocol (requires memcached 1.6+):
+  - `N` (vivify) flag for creating stubs on cache miss
+  - `R` (recache) flag for winning recache race when TTL is below threshold
+  - Response flags `W` (won recache), `X` (stale), `Z` (lost race)
+  - `delete_stale` method for marking items as stale instead of deleting
+- Add `get_with_metadata` for advanced cache operations with metadata retrieval (requires memcached 1.6+):
+  - Returns hash with `:value`, `:cas`, `:won_recache`, `:stale`, `:lost_recache`
+  - Optional `:return_hit_status` returns `:hit_before` (true/false for previous access)
+  - Optional `:return_last_access` returns `:last_access` (seconds since last access)
+  - Optional `:skip_lru_bump` prevents LRU update on access
+  - Optional `:vivify_ttl` and `:recache_ttl` for thundering herd protection
+
+Deprecations:
+
+- Binary protocol is deprecated and will be removed in Dalli 5.0. Use `protocol: :meta` instead (requires memcached 1.6+)
+- SASL authentication is deprecated and will be removed in Dalli 5.0. Consider using network-level security or memcached's TLS support
+
+4.0.1
+==========
+
+- Add `:raw` client option to skip serialization entirely, returning raw byte strings
+- Handle `OpenSSL::SSL::SSLError` in connection manager
+
+4.0.0
+==========
+
+BREAKING CHANGES:
+
+- Require Ruby 3.1+ (dropped support for Ruby 2.6, 2.7, and 3.0)
+- Removed `Dalli::Server` deprecated alias - use `Dalli::Protocol::Binary` instead
+- Removed `:compression` option - use `:compress` instead
+- Removed `close_on_fork` method - use `reconnect_on_fork` instead
+
+Other changes:
+
+- Add security warning when using default Marshal serializer (silence with `silence_marshal_warning: true`)
+- Add defense-in-depth input validation for stats command arguments
+- Add `string_fastpath` option to skip serialization for simple strings (byroot)
+- Meta protocol set performance improvement (danmayer)
+- Fix connection_pool 3.0 compatibility for Rack session store
+- Fix session recovery after deletion (stengineering0)
 - Fix cannot read response data included terminator `\r\n` when use meta protocol (matsubara0507)
+- Support SERVER_ERROR response from Memcached as per the [memcached spec](https://github.com/memcached/memcached/blob/e43364402195c8e822bb8f88755a60ab8bbed62a/doc/protocol.txt#L172) (grcooper)
+- Update Socket timeout handling to use Socket#timeout= when available (nickamorim)
+- Serializer: reraise all .load errors as UnmarshalError (olleolleolle)
+- Reconnect gracefully when a fork is detected instead of crashing (PatrickTulskie)
+- Update CI to test against memcached 1.6.40
 
 3.2.8
 ==========

@@ -25,17 +25,8 @@ module Dalli
       FLAG_COMPRESSED = 0x2
 
       def initialize(client_options)
-        # Support the deprecated compression option, but don't allow it to override
-        # an explicit compress
-        # Remove this with 4.0
-        if client_options.key?(:compression) && !client_options.key?(:compress)
-          Dalli.logger.warn "DEPRECATED: Dalli's :compression option is now just 'compress: true'.  " \
-                            'Please update your configuration.'
-          client_options[:compress] = client_options.delete(:compression)
-        end
-
         @compression_options =
-          DEFAULTS.merge(client_options.select { |k, _| OPTIONS.include?(k) })
+          DEFAULTS.merge(client_options.slice(*OPTIONS))
       end
 
       def store(value, req_options, bitflags)
@@ -47,7 +38,7 @@ module Dalli
       end
 
       def retrieve(value, bitflags)
-        compressed = (bitflags & FLAG_COMPRESSED) != 0
+        compressed = bitflags.anybits?(FLAG_COMPRESSED)
         compressed ? compressor.decompress(value) : value
 
       # TODO: We likely want to move this rescue into the Dalli::Compressor / Dalli::GzipCompressor
