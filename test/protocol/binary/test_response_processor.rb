@@ -83,6 +83,88 @@ describe Dalli::Protocol::Binary::ResponseProcessor do
     end
   end
 
+  describe '#getk' do
+    describe 'when key matches' do
+      it 'returns [key, value] tuple' do
+        test_key = 'mykey'
+        test_value = 'test_value'
+        serialized = Marshal.dump(test_value)
+        body = [0x01].pack('N') + test_key + serialized # bitflags + key + value
+        header = create_header(status: 0, key_len: test_key.bytesize, extra_len: 4, body_len: body.bytesize,
+                               cas: 12_345)
+
+        io_source.expect :read, header, [24]
+        io_source.expect :read, body, [body.bytesize]
+
+        result = processor.getk(test_key)
+
+        assert_equal [test_key, test_value], result
+        io_source.verify
+      end
+    end
+
+    describe 'when key does not match' do
+      it 'raises SocketCorruptionError' do
+        requested_key = 'expected_key'
+        response_key = 'different_key'
+        test_value = 'test_value'
+        serialized = Marshal.dump(test_value)
+        body = [0x01].pack('N') + response_key + serialized # bitflags + key + value
+        header = create_header(status: 0, key_len: response_key.bytesize, extra_len: 4, body_len: body.bytesize,
+                               cas: 12_345)
+
+        io_source.expect :read, header, [24]
+        io_source.expect :read, body, [body.bytesize]
+
+        err = assert_raises(Dalli::SocketCorruptionError) do
+          processor.getk(requested_key)
+        end
+        assert_includes err.message, 'Socket corruption detected'
+        io_source.verify
+      end
+    end
+
+    describe 'when key is not found' do
+      it 'returns [key, nil] by default' do
+        test_key = 'mykey'
+        header = create_header(status: 1)  # NOT_FOUND status
+
+        io_source.expect :read, header, [24]
+
+        result = processor.getk(test_key)
+
+        assert_equal [test_key, nil], result
+        io_source.verify
+      end
+
+      it 'returns [key, NOT_FOUND] when cache_nils is true' do
+        test_key = 'mykey'
+        header = create_header(status: 1)  # NOT_FOUND status
+
+        io_source.expect :read, header, [24]
+
+        result = processor.getk(test_key, cache_nils: true)
+
+        assert_equal [test_key, Dalli::NOT_FOUND], result
+        io_source.verify
+      end
+    end
+
+    describe 'when not stored' do
+      it 'returns false' do
+        test_key = 'mykey'
+        header = create_header(status: 5)  # NOT_STORED status
+
+        io_source.expect :read, header, [24]
+
+        result = processor.getk(test_key)
+
+        refute result
+        io_source.verify
+      end
+    end
+  end
+
   describe '#storage_response' do
     it 'returns CAS value on success' do
       cas_value = 98_765

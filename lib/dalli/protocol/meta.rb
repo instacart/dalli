@@ -33,6 +33,17 @@ module Dalli
         response_processor.meta_get_with_value(cache_nils: cache_nils?(options))
       end
 
+      def safe_get(key, options = nil)
+        encoded_key, base64 = KeyRegularizer.encode(key)
+        skip_flags = raw_mode? || (options && options[:raw])
+        req = RequestFormatter.meta_get(key: encoded_key, base64: base64, skip_flags: skip_flags, return_key: true)
+        write(req)
+        @connection_manager.flush
+        response_processor.meta_get_with_key(key, cache_nils: cache_nils?(options)).last
+      rescue Dalli::SocketCorruptionError => e
+        error_on_request!(e)
+      end
+
       def quiet_get_request(key)
         encoded_key, base64 = KeyRegularizer.encode(key)
         # Skip bitflags in raw mode - saves 2 bytes per request and skips parsing

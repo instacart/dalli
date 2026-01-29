@@ -36,6 +36,22 @@ module Dalli
           @value_marshaller.retrieve(read_data(tokens[1].to_i), bitflags_from_tokens(tokens))
         end
 
+        # Returns [key, value] and validates that the response key matches the requested key.
+        # Raises SocketCorruptionError if the keys don't match.
+        def meta_get_with_key(key, cache_nils: false)
+          tokens = error_on_unexpected!([VA, EN, HD])
+          return cache_nils ? [key, ::Dalli::NOT_FOUND] : [key, nil] if tokens.first == EN
+          return [key, true] unless tokens.first == VA
+
+          response_key = key_from_tokens(tokens)
+          if key != response_key
+            raise Dalli::SocketCorruptionError, 'Socket corruption detected - key does not match response'
+          end
+
+          value = @value_marshaller.retrieve(read_data(tokens[1].to_i), bitflags_from_tokens(tokens))
+          [key, value]
+        end
+
         def meta_get_with_value_and_cas
           tokens = error_on_unexpected!([VA, EN, HD])
           return [nil, 0] if tokens.first == EN

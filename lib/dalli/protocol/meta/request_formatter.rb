@@ -38,13 +38,14 @@ module Dalli
         def self.meta_get(key:, value: true, return_cas: false, ttl: nil, base64: false, quiet: false,
                           vivify_ttl: nil, recache_ttl: nil,
                           return_hit_status: false, return_last_access: false, skip_lru_bump: false,
-                          skip_flags: false)
+                          skip_flags: false, return_key: false)
           cmd = "mg #{key}"
           # In raw mode (skip_flags: true), we don't request bitflags since they're not used.
           # This saves 2 bytes per request and skips parsing on response.
           cmd << (skip_flags ? ' v' : ' v f') if value
           cmd << ' c' if return_cas
           cmd << ' b' if base64
+          cmd << ' k' if return_key # Return the key in response for validation
           cmd << " T#{ttl}" if ttl
           cmd << ' k q s' if quiet # Return the key in the response if quiet
           cmd << " N#{vivify_ttl}" if vivify_ttl # Thundering herd: vivify on miss

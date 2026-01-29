@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'base64'
 require_relative '../../helper'
 
 describe Dalli::Protocol::Meta::ResponseProcessor do
@@ -62,6 +63,94 @@ describe Dalli::Protocol::Meta::ResponseProcessor do
         result = processor.meta_get_with_value
 
         assert result
+        io_source.verify
+      end
+    end
+  end
+
+  describe '#meta_get_with_key' do
+    describe 'when key matches' do
+      it 'returns [key, value] tuple' do
+        test_key = 'mykey'
+        test_value = 'hello world'
+        serialized = Marshal.dump(test_value)
+
+        expect_read_line("VA #{serialized.bytesize} f1 k#{test_key}")
+        expect_read_data(serialized, serialized.bytesize)
+
+        result = processor.meta_get_with_key(test_key)
+
+        assert_equal [test_key, test_value], result
+        io_source.verify
+      end
+    end
+
+    describe 'when key does not match' do
+      it 'raises SocketCorruptionError' do
+        requested_key = 'expected_key'
+        response_key = 'different_key'
+        test_value = 'hello'
+        serialized = Marshal.dump(test_value)
+
+        expect_read_line("VA #{serialized.bytesize} f1 k#{response_key}")
+
+        err = assert_raises(Dalli::SocketCorruptionError) do
+          processor.meta_get_with_key(requested_key)
+        end
+        assert_includes err.message, 'Socket corruption detected'
+        io_source.verify
+      end
+    end
+
+    describe 'when key is not found (EN response)' do
+      it 'returns [key, nil] by default' do
+        test_key = 'mykey'
+        expect_read_line('EN')
+
+        result = processor.meta_get_with_key(test_key)
+
+        assert_equal [test_key, nil], result
+        io_source.verify
+      end
+
+      it 'returns [key, NOT_FOUND] when cache_nils is true' do
+        test_key = 'mykey'
+        expect_read_line('EN')
+
+        result = processor.meta_get_with_key(test_key, cache_nils: true)
+
+        assert_equal [test_key, Dalli::NOT_FOUND], result
+        io_source.verify
+      end
+    end
+
+    describe 'when HD response (touch success)' do
+      it 'returns [key, true]' do
+        test_key = 'mykey'
+        expect_read_line('HD')
+
+        result = processor.meta_get_with_key(test_key)
+
+        assert_equal [test_key, true], result
+        io_source.verify
+      end
+    end
+
+    describe 'with base64 encoded keys' do
+      it 'decodes the key before comparison' do
+        # Keys with spaces get base64 encoded
+        original_key = 'my key'
+        encoded_key = Base64.strict_encode64(original_key)
+        test_value = 'value'
+        serialized = Marshal.dump(test_value)
+
+        # Response includes 'b' flag indicating base64 encoding
+        expect_read_line("VA #{serialized.bytesize} f1 k#{encoded_key} b")
+        expect_read_data(serialized, serialized.bytesize)
+
+        result = processor.meta_get_with_key(original_key)
+
+        assert_equal [original_key, test_value], result
         io_source.verify
       end
     end
