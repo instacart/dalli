@@ -44,7 +44,7 @@ describe 'Network' do
 
           it 'handle socket timeouts' do
             dc = Dalli::Client.new('localhost:19123', socket_timeout: 0)
-            assert_raises Dalli::RingError, message: 'No server available' do
+            assert_raises Dalli::RingError do
               dc.get('abc')
             end
           end
@@ -75,8 +75,6 @@ describe 'Network' do
         end
 
         it 'handles operation timeouts' do
-          next if p == :binary
-
           memcached_mock(lambda { |sock|
             # handle initial version call
             sock.gets
@@ -86,9 +84,34 @@ describe 'Network' do
           }) do
             dc = Dalli::Client.new('localhost:19123', socket_timeout: 0.1, protocol: p, socket_max_failures: 0,
                                                       socket_failure_delay: 0.0, down_retry_delay: 0.0)
-            assert_raises Dalli::RingError, message: 'No server available' do
+            # With socket_max_failures: 0, the first error triggers down! which raises NetworkError.
+            # This NetworkError is not retried (only RetryableNetworkError is).
+            assert_raises Dalli::NetworkError do
               dc.get('abc')
             end
+          end
+        end
+
+        it 'does not retry NetworkError from down! with socket_max_failures: 0' do
+          next if p == :binary
+
+          memcached_mock(lambda { |sock|
+            # handle initial version call
+            sock.gets
+            sock.write("VERSION 1.6.0\r\n")
+
+            # handle the get request but never respond, causing timeout
+            sock.gets
+            sleep(0.3)
+          }) do
+            dc = Dalli::Client.new('localhost:19123', socket_timeout: 0.1, protocol: p, socket_max_failures: 0,
+                                                      socket_failure_delay: 0.0, down_retry_delay: 0.0)
+            # With socket_max_failures: 0, the first error triggers down! which raises NetworkError.
+            # This NetworkError should NOT be caught and retried by perform (only RetryableNetworkError is).
+            err = assert_raises Dalli::NetworkError do
+              dc.get('abc')
+            end
+            assert_match(/is down/, err.message)
           end
         end
 
@@ -179,6 +202,9 @@ describe 'Network' do
       end
 
       it 'handles SSL error during read operations' do
+        # JRuby's socket classes don't support Minitest's stub method aliasing
+        skip 'Minitest stub incompatible with JRuby sockets' if RUBY_ENGINE == 'jruby'
+
         with_nil_logger do
           memcached(p, 19_191) do |dc|
             # First set a value so we have something to get
@@ -198,9 +224,7 @@ describe 'Network' do
 
             ssl_error = OpenSSL::SSL::SSLError.new('SSL_read: unexpected eof while reading')
 
-            # Binary protocol uses readfull for reading, meta protocol uses gets
-            stub_method = p == :binary ? :readfull : :gets
-            server.sock.stub(stub_method, proc { raise ssl_error }) do
+            server.sock.stub(:gets, proc { raise ssl_error }) do
               # The operation will retry with a new connection and may succeed
               # What matters is the SSLError is caught, not propagated
               dc.get('ssl_test_key')
@@ -225,10 +249,30 @@ describe 'Network' do
         end
       end
 
+      it 'handles closed socket with IOError' do
+        with_nil_logger do
+          memcached_persistent(p) do |dc|
+            dc.set('test_key', 'test_value')
+
+            # Force close the socket to simulate IOError: closed stream
+            server = dc.instance_variable_get(:@ring).servers.first
+            socket = server.instance_variable_get(:@connection_manager).sock
+            socket&.close
+
+            # Should recover by reconnecting and return the cached value
+            assert_equal 'test_value', dc.get('test_key')
+          end
+        end
+      end
+
       it 'handles asynchronous Thread#raise' do
         with_nil_logger do
           memcached(p, 19_191) do |dc|
             10.times do |i|
+              # Pre-set the key so we're testing Thread#raise handling,
+              # not whether the set completed before interruption
+              dc.set("key:#{i}", i.to_s)
+
               thread = Thread.new do
                 loop do
                   assert_instance_of Integer, dc.set("key:#{i}", i.to_s)
@@ -243,6 +287,7 @@ describe 'Network' do
 
               refute_nil joined_thread
               refute_predicate joined_thread, :alive?
+              # Verify the connection is still usable after Thread#raise
               assert_equal i.to_s, dc.get("key:#{i}")
             end
           end
@@ -394,7 +439,7 @@ describe 'Network' do
       end
 
       it 'passes a simple smoke test on unix socket' do
-        memcached_persistent(:binary, MemcachedMock::UNIX_SOCKET_PATH) do |dc, path|
+        memcached_persistent(:meta, MemcachedMock::UNIX_SOCKET_PATH) do |dc, path|
           resp = dc.flush
 
           refute_nil resp

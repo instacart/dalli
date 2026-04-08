@@ -31,6 +31,9 @@ module Dalli
   # raised when Memcached response with a SERVER_ERROR
   class ServerError < DalliError; end
 
+  # socket/server communication error that can be retried
+  class RetryableNetworkError < NetworkError; end
+
   # Implements the NullObject pattern to store an application-defined value for 'Key not found' responses.
   class NilObject; end # rubocop:disable Lint/EmptyClass
   NOT_FOUND = NilObject.new
@@ -38,7 +41,7 @@ module Dalli
   QUIET = :dalli_multi
 
   def self.logger
-    @logger ||= rails_logger || default_logger
+    @logger ||= rails_logger || default_logger # rubocop:disable ThreadSafety/ClassInstanceVariable
   end
 
   def self.rails_logger
@@ -54,7 +57,7 @@ module Dalli
   end
 
   def self.logger=(logger)
-    @logger = logger
+    @logger = logger # rubocop:disable ThreadSafety/ClassInstanceVariable
   end
 end
 
@@ -62,7 +65,6 @@ require_relative 'dalli/version'
 require_relative 'dalli/instrumentation'
 
 require_relative 'dalli/compressor'
-require_relative 'dalli/protocol_deprecations'
 require_relative 'dalli/client'
 require_relative 'dalli/key_manager'
 require_relative 'dalli/pipelined_getter'
@@ -71,7 +73,6 @@ require_relative 'dalli/pipelined_deleter'
 require_relative 'dalli/ring'
 require_relative 'dalli/protocol'
 require_relative 'dalli/protocol/base'
-require_relative 'dalli/protocol/binary'
 require_relative 'dalli/protocol/connection_manager'
 require_relative 'dalli/protocol/meta'
 require_relative 'dalli/protocol/response_buffer'

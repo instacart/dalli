@@ -1,6 +1,196 @@
 Dalli Changelog
 =====================
 
+Unreleased
+==========
+
+Performance:
+
+- Eliminate double array allocation in `Client#perform` (#1093)
+  - Changed method signature from `perform(*all_args)` with destructuring to `perform(op, key, *args)`, letting Ruby decompose arguments directly without intermediate array allocations
+  - Reduces benchmark time by ~39% across all Dalli operations (get, set, delete, etc.)
+  - Thanks to Sam Obeid for this contribution
+
+Features:
+
+- Add `Dalli::Instrumentation.disable!` to allow disabling OpenTelemetry instrumentation at runtime (#1088)
+  - Also exposes `Dalli::Instrumentation.tracer=` for setting a custom tracer
+
+5.0.2
+==========
+
+Performance:
+
+- Add single-server fast path for `get_multi`, `set_multi`, and `delete_multi` (#1077)
+  - When only one memcached server is configured, bypass the `Pipelined*` machinery (IO.select, response buffering, server grouping) and issue all quiet meta requests inline followed by a noop terminator
+  - `get_multi` shows ~1.5x improvement at 10 keys and ~1.75x at 100–500 keys compared to the `PipelinedGetter` path
+  - Thanks to Dan Mayer (Shopify) for this contribution
+
+Development:
+
+- Add `bin/benchmark_branch` script for benchmarking against the current branch
+
+5.0.1
+==========
+
+Performance:
+
+- Reduce object allocations in pipelined get response processing (#1072, #1078)
+  - Offset-based `ResponseBuffer`: track a read offset instead of slicing a new string after every parsed response; compact only when the consumed portion exceeds 4KB and more than half the buffer
+  - Inline response processor parsing: avoid intermediate array allocations from `split`-based header parsing
+  - Block-based `pipeline_next_responses`: yield `(key, value, cas)` directly when a block is given, avoiding per-call Hash allocation
+  - `PipelinedGetter`: replace Hash-based socket-to-server mapping with linear scan (faster for typical 1-5 server counts); use `Process.clock_gettime(CLOCK_MONOTONIC)` instead of `Time.now`
+- Add cross-version benchmark script (`bin/compare_versions`) for reproducible performance comparisons across Dalli versions
+
+Bug Fixes:
+
+- Rescue `IOError` in connection manager `write`/`flush` methods (#1075)
+  - Prevents unhandled exceptions when a connection is closed mid-operation
+  - Thanks to Graham Cooper (Shopify) for this fix
+
+Development:
+
+- Add `rubocop-thread_safety` for detecting thread-safety issues (#1076)
+- Add CONTRIBUTING.md with AI contribution policy (#1074)
+
+5.0.0
+==========
+
+**Breaking Changes:**
+
+- **Removed binary protocol** - The meta protocol is now the only supported protocol
+  - The `:protocol` option is no longer used
+  - Requires memcached 1.6+ (for meta protocol support)
+  - Users on older memcached versions must upgrade or stay on Dalli 4.x
+
+- **Removed SASL authentication** - The meta protocol does not support authentication
+  - Use network-level security (firewall rules, VPN) or memcached's TLS support instead
+  - Users requiring SASL authentication must stay on Dalli 4.x with binary protocol
+
+- **Ruby 3.3+ required** - Dropped support for Ruby 3.1 and 3.2
+  - Ruby 3.2 reached end-of-life in March 2026
+  - JRuby remains supported
+
+Performance:
+
+- **~7% read performance improvement** (CRuby only)
+  - Use native `IO#read` instead of custom `readfull` implementation
+  - Enabled by Ruby 3.3's `IO#timeout=` support
+  - JRuby continues to use `readfull` for compatibility
+
+OpenTelemetry:
+
+- Migrate to stable OTel semantic conventions (#1070)
+  - `db.system` renamed to `db.system.name`
+  - `db.operation` renamed to `db.operation.name`
+  - `server.address` now contains hostname only; `server.port` is a separate integer attribute
+  - `get_with_metadata` and `fetch_with_lock` now include `server.address`/`server.port`
+- Add `db.query.text` span attribute with configurable modes
+  - `:otel_db_statement` option: `:include`, `:obfuscate`, or `nil` (default: omitted)
+- Add `peer.service` span attribute
+  - `:otel_peer_service` option for logical service naming
+
+Internal:
+
+- Simplified protocol directory structure: moved `lib/dalli/protocol/meta/*` to `lib/dalli/protocol/`
+- Removed deprecated binary protocol files and SASL authentication code
+- Removed `require 'set'` (autoloaded in Ruby 3.3+)
+
+4.3.3
+==========
+
+Performance:
+
+- Reduce object allocations in pipelined get response processing (#1072)
+  - Offset-based `ResponseBuffer`: track a read offset instead of slicing a new string after every parsed response; compact only when the consumed portion exceeds 4KB and more than half the buffer
+  - Inline response processor parsing: avoid intermediate array allocations from `split`-based header parsing in both binary and meta protocols
+  - Block-based `pipeline_next_responses`: yield `(key, value, cas)` directly when a block is given, avoiding per-call Hash allocation
+  - `PipelinedGetter`: replace Hash-based socket-to-server mapping with linear scan (faster for typical 1-5 server counts); use `Process.clock_gettime(CLOCK_MONOTONIC)` instead of `Time.now`
+- Add cross-version benchmark script (`bin/compare_versions`) for reproducible performance comparisons across Dalli versions
+
+Bug Fixes:
+
+- Skip OTel integration tests when meta protocol is unavailable (#1072)
+
+4.3.2
+==========
+
+OpenTelemetry:
+
+- Migrate to stable OTel semantic conventions
+  - `db.system` renamed to `db.system.name`
+  - `db.operation` renamed to `db.operation.name`
+  - `server.address` now contains hostname only; `server.port` is a separate integer attribute
+  - `get_with_metadata` and `fetch_with_lock` now include `server.address`/`server.port`
+- Add `db.query.text` span attribute with configurable modes
+  - `:otel_db_statement` option: `:include`, `:obfuscate`, or `nil` (default: omitted)
+- Add `peer.service` span attribute
+  - `:otel_peer_service` option for logical service naming
+
+4.3.1
+==========
+
+Bug Fixes:
+
+- Fix socket compatibility with gems that monkey-patch TCPSocket (#996, #1012)
+  - Gems like `socksify` and `resolv-replace` modify `TCPSocket#initialize`, breaking Ruby 3.0+'s `connect_timeout:` keyword argument
+  - Detection now uses parameter signature checking instead of gem-specific method detection
+  - Falls back to `Timeout.timeout` when monkey-patching is detected
+  - Detection result is cached for performance
+
+- Fix network retry bug with `socket_max_failures: 0` (#1065)
+  - Previously, setting `socket_max_failures: 0` could still cause retries due to error handling
+  - Introduced `RetryableNetworkError` subclass to distinguish retryable vs non-retryable errors
+  - `down!` now raises non-retryable `NetworkError`, `reconnect!` raises `RetryableNetworkError`
+  - Thanks to Graham Cooper (Shopify) for this fix
+
+- Fix "character class has duplicated range" Ruby warning (#1067)
+  - Fixed regex in `KeyManager::VALID_NAMESPACE_SEPARATORS` that caused warnings on newer Ruby versions
+  - Thanks to Hartley McGuire for this fix
+
+Improvements:
+
+- Add StrictWarnings test helper to catch Ruby warnings early (#1067)
+
+- Use bulk attribute setter for OpenTelemetry spans (#1068)
+  - Reduces lock acquisitions when setting span attributes
+  - Thanks to Robert Laurin (Shopify) for this optimization
+
+- Fix double recording of exceptions on OpenTelemetry spans (#1069)
+  - OpenTelemetry's `in_span` method already records exceptions and sets error status automatically
+  - Removed redundant explicit exception recording that caused exceptions to appear twice in traces
+  - Thanks to Robert Laurin (Shopify) for this fix
+
+4.3.0
+==========
+
+New Features:
+
+- Add `namespace_separator` option to customize the separator between namespace and key (#1019)
+  - Default is `:` for backward compatibility
+  - Must be a single non-alphanumeric character (e.g., `:`, `/`, `|`, `.`)
+  - Example: `Dalli::Client.new(servers, namespace: 'myapp', namespace_separator: '/')`
+
+Bug Fixes:
+
+- Fix architecture-dependent struct timeval packing for socket timeouts (#1034)
+  - Detects correct pack format for time_t and suseconds_t on each platform
+  - Fixes timeout issues on architectures with 64-bit time_t
+
+- Fix get_multi hanging with large key counts (#776, #941)
+  - Add interleaved read/write for pipelined gets to prevent socket buffer deadlock
+  - For batches over 10,000 keys per server, requests are now sent in chunks
+
+- **Breaking:** Enforce string-only values in raw mode (#1022)
+  - `set(key, nil, raw: true)` now raises `MarshalError` instead of storing `""`
+  - `set(key, 123, raw: true)` now raises `MarshalError` instead of storing `"123"`
+  - This matches the behavior of client-level `raw: true` mode
+  - To store counters, use string values: `set('counter', '0', raw: true)`
+
+CI:
+
+- Add TruffleRuby to CI test matrix (#988)
+
 4.2.0
 ==========
 

@@ -156,20 +156,26 @@ module Dalli
       end
 
       def read(count)
-        @sock.readfull(count)
+        # JRuby doesn't support IO#timeout=, so use custom readfull implementation
+        # CRuby 3.3+ has IO#timeout= which makes IO#read work with timeouts
+        if RUBY_ENGINE == 'jruby'
+          @sock.readfull(count)
+        else
+          @sock.read(count)
+        end
       rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError => e
         error_on_request!(e)
       end
 
       def write(bytes)
         @sock.write(bytes)
-      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS => e
+      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, IOError => e
         error_on_request!(e)
       end
 
       def flush
         @sock.flush
-      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS => e
+      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, IOError => e
         error_on_request!(e)
       end
 
@@ -199,7 +205,7 @@ module Dalli
       def reconnect!(message)
         close
         sleep(options[:socket_failure_delay]) if options[:socket_failure_delay]
-        raise Dalli::NetworkError, message
+        raise Dalli::RetryableNetworkError, message
       end
 
       def reset_down_info

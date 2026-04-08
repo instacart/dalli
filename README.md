@@ -10,26 +10,39 @@ Dalli supports:
 * Fine-grained control of data serialization and compression
 * Thread-safe operation (either through use of a connection pool, or by using the Dalli client in threadsafe mode)
 * SSL/TLS connections to memcached
-* SASL authentication
 * OpenTelemetry distributed tracing (automatic when SDK is present)
 
 The name is a variant of Salvador Dali for his famous painting [The Persistence of Memory](http://en.wikipedia.org/wiki/The_Persistence_of_Memory).
 
 ## Requirements
 
-* Ruby 3.1 or later
-* memcached 1.4 or later (1.6+ recommended for meta protocol support)
+* Ruby 3.3 or later (JRuby also supported)
+* memcached 1.6 or later
 
-## Protocol Options
+## Configuration Options
 
-Dalli supports two protocols for communicating with memcached:
+### Namespace
 
-* `:binary` (default) - Works with all memcached versions, supports SASL authentication
-* `:meta` - Requires memcached 1.6+, better performance for some operations, no authentication support
+Use namespaces to partition your cache and avoid key collisions between different applications or environments:
 
 ```ruby
-Dalli::Client.new('localhost:11211', protocol: :meta)
+# All keys will be prefixed with "myapp:"
+Dalli::Client.new('localhost:11211', namespace: 'myapp')
+
+# Dynamic namespace using a Proc (evaluated on each operation)
+Dalli::Client.new('localhost:11211', namespace: -> { "tenant:#{Thread.current[:tenant_id]}" })
 ```
+
+### Namespace Separator
+
+By default, the namespace and key are joined with a colon (`:`). You can customize this with the `namespace_separator` option:
+
+```ruby
+# Keys will be prefixed with "myapp/" instead of "myapp:"
+Dalli::Client.new('localhost:11211', namespace: 'myapp', namespace_separator: '/')
+```
+
+The separator must be a single non-alphanumeric character. Valid examples: `:`, `/`, `|`, `.`, `-`, `_`, `#`
 
 ## Security Note
 
@@ -39,7 +52,7 @@ By default, Dalli uses Ruby's Marshal for serialization. Deserializing untrusted
 Dalli::Client.new('localhost:11211', serializer: JSON)
 ```
 
-See the [4.0-Upgrade.md](4.0-Upgrade.md) guide for more information.
+See the [5.0-Upgrade.md](5.0-Upgrade.md) guide for upgrade information.
 
 ## OpenTelemetry Tracing
 
@@ -77,6 +90,20 @@ Exceptions are automatically recorded on spans with error status. When an operat
 2. The span status is set to error with the exception message
 3. The exception is re-raised to the caller
 
+### Disabling Instrumentation
+
+To disable instrumentation at runtime (e.g., in tests or specific environments):
+
+```ruby
+Dalli::Instrumentation.disable!
+```
+
+You can also assign a custom tracer directly:
+
+```ruby
+Dalli::Instrumentation.tracer = my_custom_tracer
+```
+
 ### Zero Overhead
 
 When OpenTelemetry is not present, there is zero overhead - the tracing code checks once at startup and bypasses all instrumentation logic entirely when the SDK is not loaded.
@@ -100,7 +127,7 @@ To install this gem onto your local machine, run `bundle exec rake install`.
 
 ## Contributing
 
-If you have a fix you wish to provide, please fork the code, fix in your local project and then send a pull request on github.  Please ensure that you include a test which verifies your fix and update the [changelog](CHANGELOG.md) with a one sentence description of your fix so you get credit as a contributor.
+Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute, including our policy on AI-authored contributions.
 
 ## Appreciation
 

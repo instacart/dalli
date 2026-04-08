@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 require 'base64'
-require_relative '../../helper'
+require_relative '../helper'
 
 describe Dalli::Protocol::Meta::ResponseProcessor do
   let(:io_source) { Minitest::Mock.new }
