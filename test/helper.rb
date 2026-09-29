@@ -1,15 +1,6 @@
 # frozen_string_literal: true
 
-module StrictWarnings
-  def warn(msg, **, &)
-    # Allow intentional deprecation warnings from Dalli
-    return super if msg.to_s.start_with?('[DEPRECATION]')
-
-    raise RuntimeError, msg, caller(1)
-  end
-end
-
-Warning.singleton_class.prepend(StrictWarnings)
+require_relative 'support/strict_warnings'
 
 require 'bundler/setup'
 # require 'simplecov'
@@ -33,7 +24,6 @@ raise StandardError, 'No supported version of memcached could be found.' unless 
 # Generate self-signed certs for SSL once per suite run.
 CertificateGenerator.generate
 
-# rubocop:disable Style/OneClassPerFile
 module Minitest
   class Spec
     include Memcached::Helper
@@ -77,4 +67,3 @@ module Minitest
     end
   end
 end
-# rubocop:enable Style/OneClassPerFile

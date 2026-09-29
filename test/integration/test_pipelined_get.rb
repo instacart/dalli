@@ -105,7 +105,9 @@ describe 'Pipelined Get' do
 
       describe 'single-server get_multi fast path' do
         it 'returns correct results via the fast path' do
-          memcached_persistent(p) do |dc|
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port)
+
             dc.flush
 
             dc.set('a', 'foo')
@@ -120,8 +122,12 @@ describe 'Pipelined Get' do
         end
 
         it 'returns correct results with raw mode' do
-          memcached_persistent(p, 21_345, '', raw: true) do |dc|
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port, raw: true)
+
             dc.flush
+
+            assert_raises(Dalli::MarshalError) { dc.set('n', 123) }
 
             dc.set('x', 'hello')
             dc.set('y', 'world')
@@ -133,7 +139,9 @@ describe 'Pipelined Get' do
         end
 
         it 'returns correct results with namespace' do
-          memcached_persistent(p, 21_345, '', namespace: 'ns') do |dc|
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port, namespace: 'ns')
+
             dc.flush
 
             dc.set('a', 'val_a')
@@ -142,11 +150,14 @@ describe 'Pipelined Get' do
             resp = dc.get_multi(%w[a b c])
 
             assert_equal({ 'a' => 'val_a', 'b' => 'val_b' }, resp)
+            assert_equal 'val_a', single_server_client(port).get('ns:a')
           end
         end
 
         it 'handles all misses' do
-          memcached_persistent(p) do |dc|
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port)
+
             dc.flush
 
             resp = dc.get_multi(%w[miss1 miss2 miss3])
@@ -156,7 +167,9 @@ describe 'Pipelined Get' do
         end
 
         it 'handles Unicode and space keys via fast path' do
-          memcached_persistent(p) do |dc|
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port)
+
             dc.flush
 
             dc.set('contains space', 'space_val')
@@ -169,7 +182,9 @@ describe 'Pipelined Get' do
         end
 
         it 'still uses block-based get_multi via PipelinedGetter' do
-          memcached_persistent(p) do |dc|
+          memcached_persistent(p) do |_, port|
+            dc = single_server_client(port)
+
             dc.flush
 
             dc.set('a', 'foo')

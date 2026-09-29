@@ -24,19 +24,16 @@ module Dalli
 
       # Retrieval Commands
       def get(key, options = nil)
-        encoded_key, base64 = KeyRegularizer.encode(key)
         # Skip bitflags in raw mode - saves 2 bytes per request and skips parsing
         skip_flags = raw_mode? || (options && options[:raw])
-        req = RequestFormatter.meta_get(key: encoded_key, base64: base64, skip_flags: skip_flags)
-        write(req)
-        @connection_manager.flush
+        req = RequestFormatter.meta_get(key: key, skip_flags: skip_flags)
+        flushed_write(req)
         response_processor.meta_get_with_value(cache_nils: cache_nils?(options))
       end
 
       def safe_get(key, options = nil)
-        encoded_key, base64 = KeyRegularizer.encode(key)
         skip_flags = raw_mode? || (options && options[:raw])
-        req = RequestFormatter.meta_get(key: encoded_key, base64: base64, skip_flags: skip_flags, return_key: true)
+        req = RequestFormatter.meta_get(key: key, skip_flags: skip_flags, return_key: true)
         write(req)
         @connection_manager.flush
         response_processor.meta_get_with_key(key, cache_nils: cache_nils?(options)).last
@@ -45,38 +42,30 @@ module Dalli
       end
 
       def quiet_get_request(key)
-        encoded_key, base64 = KeyRegularizer.encode(key)
         # Skip bitflags in raw mode - saves 2 bytes per request and skips parsing
-        RequestFormatter.meta_get(key: encoded_key, return_cas: true, base64: base64, quiet: true,
-                                  skip_flags: raw_mode?)
+        RequestFormatter.meta_get(key: key, return_cas: true, quiet: true, skip_flags: raw_mode?)
       end
 
       def gat(key, ttl, options = nil)
         ttl = TtlSanitizer.sanitize(ttl)
-        encoded_key, base64 = KeyRegularizer.encode(key)
         skip_flags = raw_mode? || (options && options[:raw])
-        req = RequestFormatter.meta_get(key: encoded_key, ttl: ttl, base64: base64, skip_flags: skip_flags)
-        write(req)
-        @connection_manager.flush
+        req = RequestFormatter.meta_get(key: key, ttl: ttl, skip_flags: skip_flags)
+        flushed_write(req)
         response_processor.meta_get_with_value(cache_nils: cache_nils?(options))
       end
 
       def touch(key, ttl)
         ttl = TtlSanitizer.sanitize(ttl)
-        encoded_key, base64 = KeyRegularizer.encode(key)
-        req = RequestFormatter.meta_get(key: encoded_key, ttl: ttl, value: false, base64: base64)
-        write(req)
-        @connection_manager.flush
+        req = RequestFormatter.meta_get(key: key, ttl: ttl, value: false)
+        flushed_write(req)
         response_processor.meta_get_without_value
       end
 
       # TODO: This is confusing, as there's a cas command in memcached
       # and this isn't it.  Maybe rename?  Maybe eliminate?
       def cas(key)
-        encoded_key, base64 = KeyRegularizer.encode(key)
-        req = RequestFormatter.meta_get(key: encoded_key, value: true, return_cas: true, base64: base64)
-        write(req)
-        @connection_manager.flush
+        req = RequestFormatter.meta_get(key: key, value: true, return_cas: true)
+        flushed_write(req)
         response_processor.meta_get_with_value_and_cas
       end
 
@@ -105,15 +94,13 @@ module Dalli
       #   - :hit_before - true/false if previously accessed (only if return_hit_status: true)
       #   - :last_access - seconds since last access (only if return_last_access: true)
       def meta_get(key, options = {})
-        encoded_key, base64 = KeyRegularizer.encode(key)
         req = RequestFormatter.meta_get(
-          key: encoded_key, value: true, return_cas: true, base64: base64,
+          key: key, value: true, return_cas: true,
           vivify_ttl: options[:vivify_ttl], recache_ttl: options[:recache_ttl],
           return_hit_status: options[:return_hit_status],
           return_last_access: options[:return_last_access], skip_lru_bump: options[:skip_lru_bump]
         )
-        write(req)
-        @connection_manager.flush
+        flushed_write(req)
         response_processor.meta_get_with_metadata(
           cache_nils: cache_nils?(options), return_hit_status: options[:return_hit_status],
           return_last_access: options[:return_last_access]
@@ -128,10 +115,8 @@ module Dalli
       # @param cas [Integer] optional CAS value for compare-and-swap
       # @return [Boolean] true if successful
       def delete_stale(key, cas = nil)
-        encoded_key, base64 = KeyRegularizer.encode(key)
-        req = RequestFormatter.meta_delete(key: encoded_key, cas: cas, base64: base64, stale: true)
-        write(req)
-        @connection_manager.flush
+        req = RequestFormatter.meta_delete(key: key, cas: cas, stale: true)
+        flushed_write(req)
         response_processor.meta_delete
       end
 
@@ -157,17 +142,13 @@ module Dalli
         response_processor.meta_set_with_cas unless quiet?
       end
 
-      # rubocop:disable Metrics/ParameterLists
       def write_storage_req(mode, key, raw_value, ttl = nil, cas = nil, options = {}, quiet: quiet?)
         (value, bitflags) = @value_marshaller.store(key, raw_value, options)
         ttl = TtlSanitizer.sanitize(ttl) if ttl
-        encoded_key, base64 = KeyRegularizer.encode(key)
-        req = RequestFormatter.meta_set(key: encoded_key, value: value,
+        req = RequestFormatter.meta_set(key: key, value: value,
                                         bitflags: bitflags, cas: cas,
-                                        ttl: ttl, mode: mode, quiet: quiet, base64: base64)
-        write(req)
-        write(value)
-        write(TERMINATOR)
+                                        ttl: ttl, mode: mode, quiet: quiet)
+        write("#{req}#{value}#{TERMINATOR}")
         @connection_manager.flush unless quiet
       end
       # rubocop:enable Metrics/ParameterLists
@@ -185,21 +166,16 @@ module Dalli
       # rubocop:disable Metrics/ParameterLists
       def write_append_prepend_req(mode, key, value, ttl = nil, cas = nil, _options = {})
         ttl = TtlSanitizer.sanitize(ttl) if ttl
-        encoded_key, base64 = KeyRegularizer.encode(key)
-        req = RequestFormatter.meta_set(key: encoded_key, value: value, base64: base64,
+        req = RequestFormatter.meta_set(key: key, value: value,
                                         cas: cas, ttl: ttl, mode: mode, quiet: quiet?)
-        write(req)
-        write(value)
-        write(TERMINATOR)
+        write("#{req}#{value}#{TERMINATOR}")
         @connection_manager.flush unless quiet?
       end
       # rubocop:enable Metrics/ParameterLists
 
       # Delete Commands
       def delete(key, cas)
-        encoded_key, base64 = KeyRegularizer.encode(key)
-        req = RequestFormatter.meta_delete(key: encoded_key, cas: cas,
-                                           base64: base64, quiet: quiet?)
+        req = RequestFormatter.meta_delete(key: key, cas: cas, quiet: quiet?)
         write(req)
         @connection_manager.flush unless quiet?
         response_processor.meta_delete unless quiet?
@@ -208,9 +184,13 @@ module Dalli
       # Pipelined delete - writes a quiet delete request without reading response.
       # Used by PipelinedDeleter for bulk operations.
       def pipelined_delete(key)
-        encoded_key, base64 = KeyRegularizer.encode(key)
-        req = RequestFormatter.meta_delete(key: encoded_key, base64: base64, quiet: true)
+        req = RequestFormatter.meta_delete(key: key, quiet: true)
         write(req)
+      end
+
+      def finish_pipelined_delete(sent)
+        write_noop
+        sent - response_processor.pipelined_delete_non_deletions
       end
 
       # Arithmetic Commands
@@ -224,9 +204,8 @@ module Dalli
 
       def decr_incr(incr, key, delta, ttl, initial)
         ttl = initial ? TtlSanitizer.sanitize(ttl) : nil # Only set a TTL if we want to set a value on miss
-        encoded_key, base64 = KeyRegularizer.encode(key)
-        write(RequestFormatter.meta_arithmetic(key: encoded_key, delta: delta, initial: initial, incr: incr, ttl: ttl,
-                                               quiet: quiet?, base64: base64))
+        write(RequestFormatter.meta_arithmetic(key: key, delta: delta, initial: initial, incr: incr, ttl: ttl,
+                                               quiet: quiet?))
         @connection_manager.flush unless quiet?
         response_processor.decr_incr unless quiet?
       end
@@ -246,26 +225,22 @@ module Dalli
       end
 
       def stats(info = nil)
-        write(RequestFormatter.stats(info))
-        @connection_manager.flush
+        flushed_write(RequestFormatter.stats(info))
         response_processor.stats
       end
 
       def reset_stats
-        write(RequestFormatter.stats('reset'))
-        @connection_manager.flush
+        flushed_write(RequestFormatter.stats('reset'))
         response_processor.reset
       end
 
       def version
-        write(RequestFormatter.version)
-        @connection_manager.flush
+        flushed_write(RequestFormatter.version)
         response_processor.version
       end
 
       def write_noop
-        write(RequestFormatter.meta_noop)
-        @connection_manager.flush
+        flushed_write(RequestFormatter.meta_noop)
       end
 
       # Single-server fast path for get_multi. Inlines request formatting and
@@ -273,17 +248,9 @@ module Dalli
       # machinery (IO.select, response buffering, server grouping).
       def read_multi_req(keys)
         is_raw = raw_mode?
-        # Inline request formatting — avoids RequestFormatter.meta_get overhead per key.
-        # In raw mode: "mg <key> v k q s\r\n" (no f flag, key at index 2)
-        # Normal mode: "mg <key> v f k q s\r\n" (key at index 3)
-        post_get = is_raw ? " v k q s\r\n" : " v f k q s\r\n"
-        keys.each do |key|
-          encoded_key, base64 = KeyRegularizer.encode(key)
-          write(base64 ? "mg #{encoded_key} b#{post_get}" : "mg #{encoded_key}#{post_get}")
-        end
-        write("mn\r\n")
-        @connection_manager.flush
-
+        buffer = RequestFormatter.multi_meta_get(keys, skip_flags: is_raw)
+        flushed_write(buffer)
+        buffer.clear
         read_multi_get_responses(is_raw)
       end
 
@@ -306,7 +273,8 @@ module Dalli
         raw_key = tokens[key_index]
         return unless raw_key
 
-        key = KeyRegularizer.decode(raw_key[1..], tokens.include?('b'))
+        key = raw_key[1..]
+        key = KeyRegularizer.decode(key) if tokens.include?('b')
         bitflags = is_raw ? 0 : response_processor.bitflags_from_tokens(tokens)
         [key, @value_marshaller.retrieve(value, bitflags)]
       end
@@ -315,33 +283,23 @@ module Dalli
       # minimize per-key overhead. Avoids PipelinedSetter server grouping.
       def write_multi_req(pairs, ttl, req_options)
         ttl = TtlSanitizer.sanitize(ttl) if ttl
-        pairs.each do |key, raw_value|
-          (value, bitflags) = @value_marshaller.store(key, raw_value, req_options)
-          encoded_key, base64 = KeyRegularizer.encode(key)
-          # Inline format: "ms <key> <size> c [b] F<flags> T<ttl> MS q\r\n"
-          cmd = "ms #{encoded_key} #{value.bytesize} c"
-          cmd << ' b' if base64
-          cmd << " F#{bitflags}" if bitflags
-          cmd << " T#{ttl}" if ttl
-          cmd << " MS q\r\n"
-          write(cmd)
-          write(value)
-          write(TERMINATOR)
+        entries = pairs.map do |key, raw_value|
+          [key, @value_marshaller.store(key, raw_value, req_options)]
         end
-        write_noop
+
+        buffer = RequestFormatter.multi_meta_set(entries, ttl: ttl)
+        flushed_write(buffer)
+        buffer.clear
         response_processor.consume_all_responses_until_mn
       end
 
       # Single-server fast path for delete_multi. Writes all quiet delete requests
       # terminated by a noop, then consumes all responses.
       def delete_multi_req(keys)
-        keys.each do |key|
-          encoded_key, base64 = KeyRegularizer.encode(key)
-          # Inline format: "md <key> [b] q\r\n"
-          write(base64 ? "md #{encoded_key} b q\r\n" : "md #{encoded_key} q\r\n")
-        end
-        write_noop
-        response_processor.consume_all_responses_until_mn
+        buffer = RequestFormatter.multi_meta_delete(keys)
+        flushed_write(buffer)
+        buffer.clear
+        keys.size - response_processor.pipelined_delete_non_deletions
       end
 
       require_relative 'key_regularizer'

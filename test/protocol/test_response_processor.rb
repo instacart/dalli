@@ -389,6 +389,33 @@ describe Dalli::Protocol::Meta::ResponseProcessor do
     end
   end
 
+  describe '#pipelined_delete_non_deletions' do
+    it 'returns 0 when every delete succeeded (all responses suppressed)' do
+      expect_read_line('MN')
+
+      assert_equal 0, processor.pipelined_delete_non_deletions
+      io_source.verify
+    end
+
+    it 'counts NF misses' do
+      expect_read_line('NF')
+      expect_read_line('NF')
+      expect_read_line('MN')
+
+      assert_equal 2, processor.pipelined_delete_non_deletions
+      io_source.verify
+    end
+
+    it 'counts error responses as non-deletions, not just NF misses' do
+      expect_read_line('NF')
+      expect_read_line('CLIENT_ERROR bad command line format')
+      expect_read_line('MN')
+
+      assert_equal 2, processor.pipelined_delete_non_deletions
+      io_source.verify
+    end
+  end
+
   describe 'error handling' do
     it 'raises DalliError for unexpected response' do
       expect_read_line('UNEXPECTED')
@@ -416,15 +443,15 @@ describe Dalli::Protocol::Meta::ResponseProcessor do
       buf = 'incomplete'
       result = processor.getk_response_from_buffer(buf)
 
-      assert_equal [0, nil, nil, nil, nil], result
+      assert_equal [0], result
     end
 
     it 'returns header info for complete response without body' do
       buf = "MN\r\n"
       result = processor.getk_response_from_buffer(buf)
 
-      assert_equal 4, result[0] # header length
-      assert result[1] # ok status
+      assert_equal 4, result.last # header length
+      assert result[0] # ok status
     end
   end
 end

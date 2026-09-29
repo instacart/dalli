@@ -23,13 +23,23 @@ module Dalli
         VERSION = 'VERSION'
         SERVER_ERROR = 'SERVER_ERROR'
 
+        T_OK = [OK].freeze
+        T_RESET = [RESET].freeze
+        T_EN_HD = [EN, HD].freeze
+        T_VERSION = [VERSION].freeze
+        T_VA_EN_HD = [VA, EN, HD].freeze
+        T_HD_NF_EX = [HD, NF, EX].freeze
+        T_HD_NS_NF_EX = [HD, NS, NF, EX].freeze
+        T_VA_NF_NS_EX = [VA, NF, NS, EX].freeze
+        T_END_TOKEN_STAT = [END_TOKEN, STAT].freeze
+
         def initialize(io_source, value_marshaller)
           @io_source = io_source
           @value_marshaller = value_marshaller
         end
 
         def meta_get_with_value(cache_nils: false)
-          tokens = error_on_unexpected!([VA, EN, HD])
+          tokens = error_on_unexpected!(T_VA_EN_HD)
           return cache_nils ? ::Dalli::NOT_FOUND : nil if tokens.first == EN
           return true unless tokens.first == VA
 
@@ -53,7 +63,7 @@ module Dalli
         end
 
         def meta_get_with_value_and_cas
-          tokens = error_on_unexpected!([VA, EN, HD])
+          tokens = error_on_unexpected!(T_VA_EN_HD)
           return [nil, 0] if tokens.first == EN
 
           cas = cas_from_tokens(tokens)
@@ -63,7 +73,7 @@ module Dalli
         end
 
         def meta_get_without_value
-          tokens = error_on_unexpected!([EN, HD])
+          tokens = error_on_unexpected!(T_EN_HD)
           tokens.first == EN ? nil : true
         end
 
@@ -79,7 +89,7 @@ module Dalli
         # Used by meta_get for comprehensive metadata retrieval.
         # Supports thundering herd protection (N/R flags) and metadata flags (h/l/u).
         def meta_get_with_metadata(cache_nils: false, return_hit_status: false, return_last_access: false)
-          tokens = error_on_unexpected!([VA, EN, HD])
+          tokens = error_on_unexpected!(T_VA_EN_HD)
           result = build_metadata_result(tokens)
           result[:hit_before] = hit_status_from_tokens(tokens) if return_hit_status
           result[:last_access] = last_access_from_tokens(tokens) if return_last_access
@@ -103,26 +113,26 @@ module Dalli
         end
 
         def meta_set_with_cas
-          tokens = error_on_unexpected!([HD, NS, NF, EX])
+          tokens = error_on_unexpected!(T_HD_NS_NF_EX)
           return false unless tokens.first == HD
 
           cas_from_tokens(tokens)
         end
 
         def meta_set_append_prepend
-          tokens = error_on_unexpected!([HD, NS, NF, EX])
+          tokens = error_on_unexpected!(T_HD_NS_NF_EX)
           return false unless tokens.first == HD
 
           true
         end
 
         def meta_delete
-          tokens = error_on_unexpected!([HD, NF, EX])
+          tokens = error_on_unexpected!(T_HD_NF_EX)
           tokens.first == HD
         end
 
         def decr_incr
-          tokens = error_on_unexpected!([VA, NF, NS, EX])
+          tokens = error_on_unexpected!(T_VA_NF_NS_EX)
           return false if [NS, EX].include?(tokens.first)
           return nil if tokens.first == NF
 
@@ -130,7 +140,7 @@ module Dalli
         end
 
         def stats
-          tokens = error_on_unexpected!([END_TOKEN, STAT])
+          tokens = error_on_unexpected!(T_END_TOKEN_STAT)
           values = {}
           while tokens.first != END_TOKEN
             values[tokens[1]] = tokens[2]
@@ -140,19 +150,19 @@ module Dalli
         end
 
         def flush
-          error_on_unexpected!([OK])
+          error_on_unexpected!(T_OK)
 
           true
         end
 
         def reset
-          error_on_unexpected!([RESET])
+          error_on_unexpected!(T_RESET)
 
           true
         end
 
         def version
-          tokens = error_on_unexpected!([VERSION])
+          tokens = error_on_unexpected!(T_VERSION)
           tokens.last
         end
 
@@ -163,9 +173,26 @@ module Dalli
           true
         end
 
+        # Consumes the responses to a batch of quiet (pipelined) delete
+        # requests, which are terminated by a noop (MN). In quiet mode
+        # memcached suppresses the success response for each deleted key, so
+        # every line received before the terminator corresponds to a key that
+        # was NOT deleted -- a miss (NF) or an error. Returns that count so
+        # callers can derive the number of successful deletes as
+        # (keys_sent - non_deletions).
+        def pipelined_delete_non_deletions
+          non_deletions = 0
+          tokens = next_line_to_tokens
+          until tokens.first == MN
+            non_deletions += 1
+            tokens = next_line_to_tokens
+          end
+          non_deletions
+        end
+
         def full_response_from_buffer(tokens, body, resp_size)
           value = @value_marshaller.retrieve(body, bitflags_from_tokens(tokens))
-          [resp_size, tokens.first == VA, cas_from_tokens(tokens), key_from_tokens(tokens), value]
+          [tokens.first == VA, cas_from_tokens(tokens), key_from_tokens(tokens), value, resp_size]
         end
 
         ##
@@ -180,24 +207,26 @@ module Dalli
         ##
         def getk_response_from_buffer(buf, offset = 0)
           # Find the header terminator starting from offset
-          term_idx = buf.index(TERMINATOR, offset)
-          return [0, nil, nil, nil, nil] unless term_idx
+          term_idx = buf.byteindex(TERMINATOR, offset)
+          return [0] unless term_idx
 
           header = buf.byteslice(offset, term_idx - offset)
           tokens = header.split
           header_len = header.bytesize + TERMINATOR.length
+
+          # The body len is removed from the tokens array
           body_len = body_len_from_tokens(tokens)
 
           # We have a complete response that has no body.
           # This is either the response to the terminating
           # noop or, if the status is not MN, an intermediate
           # error response that needs to be discarded.
-          return [header_len, true, nil, nil, nil] if body_len.zero?
+          return [true, header_len] if body_len.zero?
 
           resp_size = header_len + body_len + TERMINATOR.length
           # The header is in the buffer, but the body is not.  As we don't have
           # a complete response, don't advance the buffer
-          return [0, nil, nil, nil, nil] unless buf.bytesize >= offset + resp_size
+          return [0] unless buf.bytesize >= offset + resp_size
 
           # The full response is in our buffer, so parse it and return
           # the values
@@ -216,17 +245,20 @@ module Dalli
         end
 
         def bitflags_from_tokens(tokens)
-          value_from_tokens(tokens, 'f')&.to_i
+          value_from_tokens(tokens, 'f').to_i
         end
 
         def cas_from_tokens(tokens)
-          value_from_tokens(tokens, 'c')&.to_i
+          value_from_tokens(tokens, 'c').to_i
         end
 
         def key_from_tokens(tokens)
           encoded_key = value_from_tokens(tokens, 'k')
-          base64_encoded = tokens.any?('b')
-          KeyRegularizer.decode(encoded_key, base64_encoded)
+          if tokens.delete('b')
+            KeyRegularizer.decode(encoded_key)
+          else
+            encoded_key
+          end
         end
 
         # Returns true if item was previously hit, false if first access, nil if not requested
@@ -241,18 +273,22 @@ module Dalli
         # Returns seconds since last access, or nil if not requested
         # The l flag returns l<seconds>
         def last_access_from_tokens(tokens)
-          value_from_tokens(tokens, 'l')&.to_i
+          value_from_tokens(tokens, 'l').to_i
         end
 
         def body_len_from_tokens(tokens)
-          value_from_tokens(tokens, 's')&.to_i
+          value_from_tokens(tokens, 's').to_i
         end
 
         def value_from_tokens(tokens, flag)
-          bitflags_token = tokens.find { |t| t.start_with?(flag) }
-          return 0 unless bitflags_token
-
-          bitflags_token[1..]
+          # NB: as an optimization, we're mutating the matching token in place
+          # so there is a baked assumption that we're only accessing each token at most once.
+          index = tokens.find_index { |t| t.start_with?(flag) }
+          if index
+            tokens.delete_at(index).delete_prefix!(flag)
+          else
+            0
+          end
         end
 
         def read_line
