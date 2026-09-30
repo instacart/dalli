@@ -283,7 +283,7 @@ describe Dalli::Protocol::ValueSerializer do
         error = ->(_arg) { raise TypeError, error_message }
         exception = serializer.stub :load, error do
           assert_raises Dalli::UnmarshalError do
-            vs.retrieve(raw_value, Dalli::Protocol::ValueSerializer::FLAG_SERIALIZED)
+            vs.retrieve(raw_value, Dalli::Flags::SERIALIZED)
           end
         end
 
@@ -300,7 +300,7 @@ describe Dalli::Protocol::ValueSerializer do
         error = ->(_arg) { raise TypeError, error_message }
         exception = serializer.stub :load, error do
           assert_raises Dalli::UnmarshalError do
-            vs.retrieve(raw_value, Dalli::Protocol::ValueSerializer::FLAG_SERIALIZED)
+            vs.retrieve(raw_value, Dalli::Flags::SERIALIZED)
           end
         end
 
@@ -315,7 +315,7 @@ describe Dalli::Protocol::ValueSerializer do
 
       it 'raises UnmarshalError on uninitialized constant' do
         exception = assert_raises Dalli::UnmarshalError do
-          vs.retrieve(raw_value, Dalli::Protocol::ValueSerializer::FLAG_SERIALIZED)
+          vs.retrieve(raw_value, Dalli::Flags::SERIALIZED)
         end
 
         assert_equal exception.cause.message, error_message
@@ -329,7 +329,7 @@ describe Dalli::Protocol::ValueSerializer do
 
       it 'raises UnmarshalError on uninitialized constant' do
         exception = assert_raises Dalli::UnmarshalError do
-          vs.retrieve(raw_value, Dalli::Protocol::ValueSerializer::FLAG_SERIALIZED)
+          vs.retrieve(raw_value, Dalli::Flags::SERIALIZED)
         end
 
         assert exception.cause.message.start_with?(error_message)
@@ -345,7 +345,7 @@ describe Dalli::Protocol::ValueSerializer do
         error = ->(_arg) { raise NameError, error_message }
         exception = serializer.stub :load, error do
           assert_raises Dalli::UnmarshalError do
-            vs.retrieve(raw_value, Dalli::Protocol::ValueSerializer::FLAG_SERIALIZED)
+            vs.retrieve(raw_value, Dalli::Flags::SERIALIZED)
           end
         end
 
@@ -360,7 +360,7 @@ describe Dalli::Protocol::ValueSerializer do
 
       it 'raises UnmarshalError on uninitialized constant' do
         exception = assert_raises Dalli::UnmarshalError do
-          vs.retrieve(raw_value, Dalli::Protocol::ValueSerializer::FLAG_SERIALIZED)
+          vs.retrieve(raw_value, Dalli::Flags::SERIALIZED)
         end
 
         assert_equal exception.cause.message, error_message
@@ -374,7 +374,7 @@ describe Dalli::Protocol::ValueSerializer do
 
       it 'raises UnmarshalError on uninitialized constant' do
         exception = assert_raises Dalli::UnmarshalError do
-          vs.retrieve(raw_value, Dalli::Protocol::ValueSerializer::FLAG_SERIALIZED)
+          vs.retrieve(raw_value, Dalli::Flags::SERIALIZED)
         end
 
         assert_equal exception.cause.message, error_message
@@ -388,14 +388,66 @@ describe Dalli::Protocol::ValueSerializer do
       let(:vs) { Dalli::Protocol::ValueSerializer.new(vs_options) }
 
       it 'properly deserializes the serialized value' do
-        assert_equal vs.retrieve(serialized_value, Dalli::Protocol::ValueSerializer::FLAG_SERIALIZED),
+        assert_equal vs.retrieve(serialized_value, Dalli::Flags::SERIALIZED),
                      deserialized_value
       end
 
       it 'raises UnmarshalError for non-serialized data' do
         assert_raises Dalli::UnmarshalError do
-          vs.retrieve(:not_serialized_value, Dalli::Protocol::ValueSerializer::FLAG_SERIALIZED)
+          vs.retrieve(:not_serialized_value, Dalli::Flags::SERIALIZED)
         end
+      end
+    end
+  end
+
+  describe 'string_fastpath' do
+    let(:utf8_string)   { 'héllø' }
+    let(:binary_string) { "\0\xff".b }
+
+    describe 'client-level option' do
+      it 'is disabled by default' do
+        vs = Dalli::Protocol::ValueSerializer.new(silence_marshal_warning: true)
+        _, flags = vs.store(utf8_string, nil, 0)
+
+        assert flags.anybits?(Dalli::Flags::SERIALIZED), 'expected SERIALIZED flag when fastpath is off'
+        refute flags.anybits?(Dalli::Flags::UTF8), 'expected no UTF8 flag when fastpath is off'
+      end
+
+      it 'bypasses the serializer for UTF-8 strings when enabled' do
+        vs = Dalli::Protocol::ValueSerializer.new(string_fastpath: true, silence_marshal_warning: true)
+        value, flags = vs.store(utf8_string, nil, 0)
+
+        assert_equal utf8_string, value
+        assert flags.anybits?(Dalli::Flags::UTF8), 'expected UTF8 flag'
+        refute flags.anybits?(Dalli::Flags::SERIALIZED), 'expected no SERIALIZED flag'
+      end
+
+      it 'bypasses the serializer for binary strings when enabled' do
+        vs = Dalli::Protocol::ValueSerializer.new(string_fastpath: true, silence_marshal_warning: true)
+        value, flags = vs.store(binary_string, nil, 0)
+
+        assert_equal binary_string, value
+        refute flags.anybits?(Dalli::Flags::UTF8), 'expected no UTF8 flag for binary'
+        refute flags.anybits?(Dalli::Flags::SERIALIZED), 'expected no SERIALIZED flag for binary'
+      end
+    end
+
+    describe 'per-request option overrides client-level option' do
+      it 'per-request true overrides client-level false' do
+        vs = Dalli::Protocol::ValueSerializer.new(string_fastpath: false, silence_marshal_warning: true)
+        value, flags = vs.store(utf8_string, { string_fastpath: true }, 0)
+
+        assert_equal utf8_string, value
+        assert flags.anybits?(Dalli::Flags::UTF8)
+        refute flags.anybits?(Dalli::Flags::SERIALIZED)
+      end
+
+      it 'per-request false overrides client-level true' do
+        vs = Dalli::Protocol::ValueSerializer.new(string_fastpath: true, silence_marshal_warning: true)
+        _, flags = vs.store(utf8_string, { string_fastpath: false }, 0)
+
+        assert flags.anybits?(Dalli::Flags::SERIALIZED)
+        refute flags.anybits?(Dalli::Flags::UTF8)
       end
     end
   end

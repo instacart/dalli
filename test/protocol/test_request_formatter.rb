@@ -89,6 +89,26 @@ describe Dalli::Protocol::Meta::RequestFormatter do
     end
   end
 
+  describe 'multi_meta_get' do
+    it 'includes flags by default' do
+      expected = <<~TXT
+        mg foo v f k q s\r
+        mg YmFy4oKs b v f k q s\r
+        mn\r
+      TXT
+      assert_equal expected, Dalli::Protocol::Meta::RequestFormatter.multi_meta_get(['foo', 'bar€'])
+    end
+
+    it 'does not include flags if specified' do
+      expected = <<~TXT
+        mg foo v k q s\r
+        mg YmFy4oKs b v k q s\r
+        mn\r
+      TXT
+      assert_equal expected, Dalli::Protocol::Meta::RequestFormatter.multi_meta_get(['foo', 'bar€'], skip_flags: true)
+    end
+  end
+
   describe 'meta_set' do
     let(:key) { SecureRandom.hex(4) }
     let(:hexlen) { rand(500..999) }
@@ -145,16 +165,53 @@ describe Dalli::Protocol::Meta::RequestFormatter do
                                                                     cas: "\nset importantkey 1 1000 8\ninjected")
     end
 
-    it 'sets the quiet mode if configured' do
-      assert_equal "ms #{key} #{val.bytesize} c F#{bitflags} MS q\r\n",
+    it 'sets the quiet mode if configured, skipping the cas-return flag' do
+      assert_equal "ms #{key} #{val.bytesize} F#{bitflags} MS q\r\n",
                    Dalli::Protocol::Meta::RequestFormatter.meta_set(key: key, value: val, bitflags: bitflags,
                                                                     quiet: true)
     end
 
-    it 'sets the base64 mode if configured' do
-      assert_equal "ms #{key} #{val.bytesize} c b F#{bitflags} MS\r\n",
+    it 'retains the cas-return flag when not in quiet mode' do
+      assert_equal "ms #{key} #{val.bytesize} c F#{bitflags} MS\r\n",
                    Dalli::Protocol::Meta::RequestFormatter.meta_set(key: key, value: val, bitflags: bitflags,
-                                                                    base64: true)
+                                                                    quiet: false)
+    end
+
+    it 'sets the base64 mode if required' do
+      key = 'péter'
+
+      assert_equal "ms cMOpdGVy #{val.bytesize} c b F#{bitflags} MS\r\n",
+                   Dalli::Protocol::Meta::RequestFormatter.meta_set(key: key, value: val, bitflags: bitflags)
+    end
+  end
+
+  describe 'multi_meta_set' do
+    it 'returns the default when just passed keys and values' do
+      expected = <<~TXT
+        ms foo 5 c F2433 MS q\r
+        VALUE\r
+        ms YmFy4oKs 5 c b F12 MS q\r
+        OTHER\r
+        mn\r
+      TXT
+      assert_equal expected, Dalli::Protocol::Meta::RequestFormatter.multi_meta_set({
+                                                                                      'foo' => ['VALUE', 2433],
+                                                                                      'bar€' => ['OTHER', 12]
+                                                                                    })
+    end
+
+    it 'incorporates TTL when passed' do
+      expected = <<~TXT
+        ms foo 5 c F2433 T42 MS q\r
+        VALUE\r
+        ms YmFy4oKs 5 c b F12 T42 MS q\r
+        OTHER\r
+        mn\r
+      TXT
+      assert_equal expected, Dalli::Protocol::Meta::RequestFormatter.multi_meta_set({
+                                                                                      'foo' => ['VALUE', 2433],
+                                                                                      'bar€' => ['OTHER', 12]
+                                                                                    }, ttl: 42)
     end
   end
 
@@ -188,9 +245,11 @@ describe Dalli::Protocol::Meta::RequestFormatter do
                                                                        cas: "\nset importantkey 1 1000 8\ninjected")
     end
 
-    it 'sets the base64 mode if configured' do
-      assert_equal "md #{key} b\r\n",
-                   Dalli::Protocol::Meta::RequestFormatter.meta_delete(key: key, base64: true)
+    it 'sets the base64 mode if needed' do
+      key = 'péter'
+
+      assert_equal "md cMOpdGVy b\r\n",
+                   Dalli::Protocol::Meta::RequestFormatter.meta_delete(key: key)
     end
 
     describe 'stale flag (thundering herd protection)' do
@@ -203,6 +262,17 @@ describe Dalli::Protocol::Meta::RequestFormatter do
         assert_equal "md #{key} I q\r\n",
                      Dalli::Protocol::Meta::RequestFormatter.meta_delete(key: key, stale: true, quiet: true)
       end
+    end
+  end
+
+  describe 'multi_meta_delete' do
+    it 'returns the default' do
+      expected = <<~TXT
+        md foo q\r
+        md YmFy4oKs b q\r
+        mn\r
+      TXT
+      assert_equal expected, Dalli::Protocol::Meta::RequestFormatter.multi_meta_delete(['foo', 'bar€'])
     end
   end
 
@@ -264,10 +334,11 @@ describe Dalli::Protocol::Meta::RequestFormatter do
                                                                            quiet: true)
     end
 
-    it 'sets the base64 mode if configured' do
-      assert_equal "ma #{key} v b D#{delta} J#{initial} N0 MI\r\n",
-                   Dalli::Protocol::Meta::RequestFormatter.meta_arithmetic(key: key, delta: delta, initial: initial,
-                                                                           base64: true)
+    it 'sets the base64 mode if needed' do
+      key = 'péter'
+
+      assert_equal "ma cMOpdGVy b v D#{delta} J#{initial} N0 MI\r\n",
+                   Dalli::Protocol::Meta::RequestFormatter.meta_arithmetic(key: key, delta: delta, initial: initial)
     end
   end
 
@@ -351,6 +422,85 @@ describe Dalli::Protocol::Meta::RequestFormatter do
 
       assert_equal "flush_all #{delay} noreply\r\n",
                    Dalli::Protocol::Meta::RequestFormatter.flush(delay: delay, quiet: true)
+    end
+  end
+
+  describe '.encoded_key' do
+    def assert_raw(key)
+      assert_equal key, Dalli::Protocol::Meta::RequestFormatter.encoded_key(key)
+    end
+
+    def assert_encoded(key)
+      encoded_key = Dalli::Protocol::Meta::RequestFormatter.encoded_key(key)
+
+      assert encoded_key.delete_suffix!(' b')
+      assert_equal key.b, encoded_key.unpack1('m0')
+    end
+
+    it 'returns original key for simple ASCII keys' do
+      assert_raw 'simple_key_123'
+    end
+
+    it 'returns original key for ASCII keys with special characters' do
+      assert_raw 'key:with:colons-and_underscores.and.dots'
+    end
+
+    it 'returns base64 encoded key for keys with spaces' do
+      assert_encoded 'key with spaces'
+    end
+
+    it 'returns base64 encoded key for keys with tabs' do
+      assert_encoded "key\twith\ttabs"
+    end
+
+    it 'returns base64 encoded key for keys with newlines' do
+      assert_encoded "key\nwith\nnewlines"
+    end
+
+    it 'returns base64 encoded key for non-ASCII keys (Unicode)' do
+      assert_encoded 'clé_française'
+    end
+
+    it 'returns base64 encoded key for emoji keys' do
+      assert_encoded 'user:🎉:profile'
+    end
+
+    it 'handles empty keys' do
+      assert_raw ''
+    end
+  end
+
+  # GHSA-6wmv-xq9m-fmp7: numeric flag values are interpolated into the
+  # command line, so each must be converted to an Integer rather than written
+  # as given, or a String carrying CRLF injects further memcached commands.
+  describe 'numeric flag validation' do
+    let(:formatter) { Dalli::Protocol::Meta::RequestFormatter }
+    let(:payload) { "1\r\nflush_all\r\n" }
+
+    {
+      'meta_arithmetic initial' => ->(f, v) { f.meta_arithmetic(key: 'ctr', delta: 1, initial: v) },
+      'meta_arithmetic delta' => ->(f, v) { f.meta_arithmetic(key: 'ctr', delta: v, initial: nil) },
+      'meta_arithmetic ttl' => ->(f, v) { f.meta_arithmetic(key: 'ctr', delta: 1, initial: 0, ttl: v) },
+      'meta_get ttl' => ->(f, v) { f.meta_get(key: 'k', ttl: v) },
+      'meta_get vivify_ttl' => ->(f, v) { f.meta_get(key: 'k', vivify_ttl: v) },
+      'meta_get recache_ttl' => ->(f, v) { f.meta_get(key: 'k', recache_ttl: v) },
+      'meta_set ttl' => ->(f, v) { f.meta_set(key: 'k', value: 'v', ttl: v) },
+      'multi_meta_set ttl' => ->(f, v) { f.multi_meta_set({ 'k' => ['v', 0] }, ttl: v) },
+      'meta_delete ttl' => ->(f, v) { f.meta_delete(key: 'k', ttl: v) }
+    }.each do |name, build|
+      it "rejects a CRLF-bearing #{name}" do
+        error = assert_raises(ArgumentError) { build.call(formatter, payload) }
+        assert_match(/must be an Integer/, error.message)
+      end
+
+      it "rejects a non-numeric #{name}" do
+        assert_raises(ArgumentError) { build.call(formatter, 'abc') }
+        assert_raises(ArgumentError) { build.call(formatter, Object.new) }
+      end
+
+      it "accepts a decimal String #{name} and writes it as an Integer" do
+        assert_equal build.call(formatter, 10), build.call(formatter, '010')
+      end
     end
   end
 end

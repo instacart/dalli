@@ -4,6 +4,172 @@ Dalli Changelog
 Unreleased
 ==========
 
+5.0.7
+==========
+
+Security:
+
+- Fix memcached command injection through numeric arguments (GHSA-6wmv-xq9m-fmp7)
+  - The `default` argument of `incr`/`decr`, and `fetch_with_lock`'s `lock_ttl` and `recache_threshold`, were written into the meta protocol command without conversion, so a String containing CRLF injected additional memcached commands (e.g. `set`, `flush_all`) on the connection
+  - These arguments must now be Integers, or Strings of decimal digits; anything else raises `ArgumentError` before a request is sent
+  - As defense in depth, `RequestFormatter` now converts every numeric flag it writes (`D`, `J`, `N`, `R`, `T`) to an Integer
+  - Thanks to oss-security-shop for the report
+
+5.0.6
+==========
+
+Performance:
+
+- Skip the cas-return flag on quiet `meta_set` requests (#1131)
+  - In quiet mode memcached suppresses the `ms` response entirely, so the CAS requested by the `c` flag can never be read; sending it only added two bytes to every request
+  - Applies to the bulk-write paths, where quiet sets are emitted: `Dalli::Client#multi` blocks and the pipelined setter
+  - Extracted from #1130; thanks to Jianbin Chen for this contribution
+
+- Reduce allocations in `KeyRegularizer` and multi-key request paths (#1120)
+  - Decomposed `KeyRegularizer#encode` into separate `needs_encoding?` and `encode` calls so the common happy path avoids allocating an intermediate array for the two-element return value
+  - Refactored `multi_get`/`multi_set`/`multi_delete` command generation into `RequestFormatter` to share its key-encoding helpers
+  - Thanks to Jean Boussier for this contribution
+
+- Reduce allocations in `ResponseBuffer` pipelined getk parsing (#1117)
+  - `process_single_getk_response` was building a fresh array to return results alongside the updated offset; refactored to store the offset as the last element of the existing tokens array and pop it, saving one allocation per response
+  - Also skips trailing nils in the token array
+  - Thanks to Jean Boussier for this contribution
+
+- Enable frozen string literals in `RequestFormatter` (#1118)
+  - Frozen string literals had been inadvertently disabled; re-enabling reduces allocations by ~300,000 objects in a 10,000-iteration `get_multi_cas` benchmark (562 MB → 550 MB total allocated)
+  - Thanks to Jean Boussier for this contribution
+
+- Reduce allocations in `ResponseProcessor#value_from_tokens` (#1113)
+  - `token[1..].to_i` was allocating a new string for every token parsed; replaced with in-place `slice!` followed by a token reset to avoid poisoning subsequent token comparisons
+  - Saves 4 allocations per entry in `get_multi_cas` workloads (a hotspot for IdentityCache)
+  - Thanks to Jean Boussier for this contribution
+
+- Reduce allocations in common operation paths (#1111)
+  - Use `Symbol#name` over `Symbol#to_s` to return a frozen string without allocation
+  - Skip trace attribute hash construction when OpenTelemetry instrumentation is disabled
+  - Use argument forwarding (`...`) in `Client#perform` and `Threadsafe#request` to avoid splat array allocation
+  - Use `match?` in `KeyRegularizer#encode` to avoid `MatchData` object allocation
+  - Reduces objects allocated by ~26% and memory by ~6% for a simple `get` workload
+  - Thanks to Jean Boussier for this contribution
+
+- Fix pathological memory behavior in `ResponseBuffer` (#1114)
+  - `compact_if_needed` was intended to reclaim memory by slicing off consumed bytes, but `buffer.byteslice(@offset..)` on an unfrozen string causes Ruby to allocate a hidden third string as the copy-on-write owner rather than freeing the original
+  - Redesigns buffer management to pass reusable buffer objects directly to `read`/`read_nonblock`, avoiding reallocation on each response read
+  - Reduces allocations from ~2.38 GB to ~649 MB in a `get_multi_cas` benchmark over 10,000 iterations
+  - Accompanied by new unit tests for `ResponseBuffer` (#1115)
+  - Thanks to Jean Boussier for this contribution
+
+Features:
+
+- `delete_multi` now returns the number of keys found and deleted (#1126)
+  - Previously the return value was unspecified; callers (e.g. Rails, see rails/rails#58071) had no way to tell how many keys were actually removed
+  - The count is derived from the meta protocol's quiet-mode delete responses with no extra round-trips: successful deletes are suppressed while misses report `NF`, so any response received before the terminator is a key that was not deleted
+  - The single-server fast path now shares the pipelined path's bounded retry on transient (`RetryableNetworkError`) network errors, so both paths behave consistently; the returned count is best-effort and may under-report if a network error triggers a retry, since keys deleted before the error are not recounted
+  - Thanks to Iliana Hadzhiatanasova for this contribution
+
+Bug Fixes:
+
+- Raise instead of returning a truncated value when the peer closes mid-response (#1135)
+  - `IO#read(count)` on a blocking socket accumulates across TCP chunks and hands back a shorter buffer (or `nil`) in only one case: the stream hit EOF. That short buffer was passed through as the response body, so a memcached restart, proxy drop, or load balancer timeout partway through a response could surface a truncated but still decodable value to the caller, indistinguishable from a real one
+  - A short read is now treated as the premature EOF it is, raising and closing the dirty socket so the request is retried on a fresh connection
+  - CRuby only; the JRuby path already used `Socket#readfull`, which enforces the same contract
+  - Extracted from #1130; thanks to Ian Ker-Seymer for the original fix and Jianbin Chen for the port
+
+- Tear down the connection when a non-`StandardError` aborts a request (#1136)
+  - `Async::Stop` and `Thread#kill` descend from `Exception` rather than `StandardError`, so the rescue clauses in `Protocol::Base#request` never saw them; a scheduler cancelling a fiber parked on a response read skipped `close` entirely, leaving the connection marked as having a request in progress with partial response bytes still unread on the wire, and returning that half-used client to the pool under `connection_pool`
+  - `Protocol::Base#request` now closes in an `ensure` unless the request ran to completion, and `ConnectionManager#close` performs its state cleanup in an `ensure` so a second cancellation landing inside `@sock.close` cannot leave the socket non-nil with the request still marked in progress
+  - `Dalli::DalliError` and `Dalli::MarshalError` now close the connection at the point of failure rather than at the start of the next request; those paths already left the request in progress and `ConnectionManager#confirm_ready!` closed on the next call, so this changes when the close happens rather than adding one
+  - Extracted from #1130; thanks to Dan Mayer for the original fix and Jianbin Chen for the port
+
+- Fix `ResponseBuffer` compaction logic (#1119)
+  - `COMPACT_THRESHOLD` was removed in #1116 as apparently unused, but the constant was referenced by the compaction guard; its absence silently disabled buffer compaction
+  - Restored the constant, corrected the compaction condition, and improved the buffer-shrinking implementation to use `String#bytesplice` (backed by `memmove`) for true in-place compaction
+  - Adds targeted tests covering the compaction threshold and shrink behavior
+  - Thanks to Jean Boussier for this contribution
+
+Maintenance:
+
+- Scope `StrictWarnings` to Dalli's own source (#1134)
+  - The test suite runs under `-w` and prepends a hook to `Warning.singleton_class` that turns warnings into failures, but that hook is global: a warning emitted while loading any third-party gem aborted the whole suite before a single test ran
+  - `json` 2.21.2's pure-Ruby generator (used on JRuby, where the C extension is unavailable) warns `method redefined; discarding old to_hash` at require time, which took the `jruby-10` CI job red with no change to Dalli
+  - Warnings are now attributed to a source file and only raise for `lib/` and `test/`; attribution prefers the location Ruby embeds in the message, since the stack at that point describes the require chain rather than the offending code
+  - Portable attribution of `Kernel#warn` callers also required walking the stack rather than indexing it (Ruby 3.3/3.4 push an `<internal:warning>` frame that 4.0 does not), skipping RubyGems' `Kernel#warn` shim (active on JRuby but not CRuby), and resolving relative backtrace paths
+
+- Make raw and namespace fast path tests actually use those options (#1129)
+  - Followup to #1127: the `raw` and `namespace` variants passed those options to the helper that starts memcached, which configures the client the tests then discarded, so neither option was ever exercised
+  - Passes the options to the client under test and adds assertions that fail if they are absent
+  - Thanks to Iliana Hadzhiatanasova for this contribution
+
+- Benchmark `set_multi` and add a `delete_multi` target (#1132)
+  - Enables the two `set_multi` reports that were commented out pending the arrival of `set_multi`, resolving the accompanying TODO
+  - Adds a `delete_multi` target comparing the pipelined path against N single deletes
+  - Extracted from #1130; thanks to Jianbin Chen for this contribution
+
+- Bump CI memcached to 1.6.41 and run benchmarks on pull requests (#1133)
+  - The tests workflow moves from 1.6.40 to 1.6.41; the benchmarks and profile workflows had drifted back on 1.6.23
+  - Extracted from #1130; thanks to Jianbin Chen for this contribution
+
+- Disable RuboCop metrics cops (#1128)
+  - Thanks to Jean Boussier for this contribution
+
+- Remove `PIDCache` module (#1125)
+  - `Process.pid` is cached natively by Ruby 3.3+ (via https://bugs.ruby-lang.org/issues/19443), making the manual cache unnecessary now that Dalli requires Ruby 3.3+
+  - Thanks to Jean Boussier for this contribution
+
+- Remove unused `COMPACT_THRESHOLD` constant from `ResponseBuffer` (#1116)
+  - Followup cleanup after the buffer management redesign in #1114
+  - Note: subsequently found to be in use; restored and corrected in #1119
+  - Thanks to Jean Boussier for this contribution
+
+- Use `String#byteindex` instead of `String#index` when searching for the response terminator in `getk_response_from_buffer` (#1112)
+  - The result feeds directly into `byteslice`; `byteindex` makes the intent explicit, though both return the same value since the buffer encoding is always `BINARY`
+  - Thanks to Jean Boussier for this contribution
+
+- Make single-server fast path tests actually exercise the fast path (#1127)
+  - The batch-operation tests built clients through a helper that registers two address aliases for the same memcached process, so every client had a 2-server ring and the tests always ran through the pipelined path instead of the single-server fast path
+  - Adds a `single_server_client` test helper that builds a client with a single address, and uses it in the affected `get_multi`, `set_multi`, and `delete_multi` tests
+  - Thanks to Iliana Hadzhiatanasova for this contribution
+
+5.0.5
+==========
+
+Performance:
+
+- Batch multi-key commands into a single write to reduce packet overhead (#1107)
+  - With `TCP_NODELAY` set on sockets, each `write` call emits a separate packet; the meta protocol was calling `write` up to 3 times per key in multi-key operations (`get_multi`, `set_multi`, `delete_multi`), significantly increasing network traffic compared to the old binary protocol
+  - Multi-key request paths now buffer all per-key commands into a single binary string and flush once; single-key paths combine the write and flush into one `flushed_write` call
+  - Thanks to Jean Boussier for this contribution
+
+- Avoid repeated `RUBY_ENGINE` checks on every socket read (#1103)
+  - Moved the JRuby branch from a runtime `if` inside `ConnectionManager#read` to a class-level conditional method definition, so the check happens once at load time rather than on every read call
+  - Thanks to Jean Boussier for this contribution
+
+- Eliminate per-call array allocations in `ResponseProcessor` (#1104)
+  - Token sets passed to `error_on_unexpected!` (e.g. `[VA, EN, HD]`) were allocated as new arrays on every invocation; replaced with frozen constants defined once at class load time
+  - Thanks to Jean Boussier for this contribution
+
+- Avoid string copies when building request commands in `RequestFormatter` (#1106)
+  - Changed `cmd + TERMINATOR` to `cmd << TERMINATOR`; since `cmd` is always a mutable string, the in-place append avoids copying the entire command string just to append two bytes
+  - Thanks to Jean Boussier for this contribution
+
+5.0.4
+==========
+
+Bug fixes:
+
+- Fix `string_fastpath` flag collision with compression (#1099)
+  - `ValueSerializer::FLAG_UTF8` and `ValueCompressor::FLAG_COMPRESSED` were both `0x2`, causing `Dalli::UnmarshalError` on any UTF-8 string written with `string_fastpath: true` when compression is enabled, and silent encoding corruption for binary strings
+  - Introduces `Dalli::Flags` to centralise bit flag constants; UTF8 is reassigned to `0x4`
+  - Adds regression test covering short/long UTF-8, binary, and cross-client read scenarios
+  - Thanks to Jean Boussier and Mikael Henriksson for the fix and regression test
+
+- Fix client-level `string_fastpath: true` being silently ignored (#1101)
+  - `Dalli::Client.new(servers, string_fastpath: true)` had no effect; the fast path was only taken when `string_fastpath: true` was passed as a per-request option on each `set` call
+  - Per-request option continues to take precedence over the client-level setting in both directions
+
+5.0.3
+==========
+
 Performance:
 
 - Eliminate double array allocation in `Client#perform` (#1093)
@@ -12,6 +178,8 @@ Performance:
   - Thanks to Sam Obeid for this contribution
 
 Features:
+
+- Support `connect_timeout:` keyword argument with `resolv-replace` >= 0.2.0, which now correctly forwards keyword arguments through its `TCPSocket` patch (#1096)
 
 - Add `Dalli::Instrumentation.disable!` to allow disabling OpenTelemetry instrumentation at runtime (#1088)
   - Also exposes `Dalli::Instrumentation.tracer=` for setting a custom tracer

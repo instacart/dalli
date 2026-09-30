@@ -4,8 +4,6 @@ require 'English'
 require 'socket'
 require 'timeout'
 
-require 'dalli/pid_cache'
-
 module Dalli
   module Protocol
     ##
@@ -54,7 +52,7 @@ module Dalli
 
         @sock = memcached_socket
         @sock.sync = false # Enable buffered I/O for better performance
-        @pid = PIDCache.pid
+        @pid = Process.pid
         @request_in_progress = false
       rescue SystemCallError, *TIMEOUT_ERRORS, EOFError, SocketError => e
         # SocketError = DNS resolution failure
@@ -117,10 +115,16 @@ module Dalli
           @sock.close
         rescue StandardError
           nil
+        ensure
+          # A non-StandardError (e.g. a second Async::Stop fired into the
+          # fiber while it is already inside this cleanup) can escape
+          # @sock.close; run the state cleanup unconditionally so the client
+          # isn't returned to the pool with a half-closed socket and
+          # @request_in_progress == true.
+          @sock = nil
+          @pid = nil
+          abort_request!
         end
-        @sock = nil
-        @pid = nil
-        abort_request!
       end
 
       def connected?
@@ -155,17 +159,25 @@ module Dalli
         error_on_request!(e)
       end
 
-      def read(count)
-        # JRuby doesn't support IO#timeout=, so use custom readfull implementation
-        # CRuby 3.3+ has IO#timeout= which makes IO#read work with timeouts
-        if RUBY_ENGINE == 'jruby'
+      # JRuby doesn't support IO#timeout=, so use custom readfull implementation
+      # CRuby 3.3+ has IO#timeout= which makes IO#read work with timeouts
+      if RUBY_ENGINE == 'jruby'
+        def read(count)
           @sock.readfull(count)
-        else
-          @sock.read(count)
+        rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError => e
+          error_on_request!(e)
         end
-      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError => e
-        error_on_request!(e)
+      else
+        def read(count)
+          read_bytes(count)
+        rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError => e
+          error_on_request!(e)
+        end
       end
+
+      # Alias for callers that want to make the exact-length contract explicit
+      # at the call site.
+      alias read_exact read
 
       def write(bytes)
         @sock.write(bytes)
@@ -179,10 +191,18 @@ module Dalli
         error_on_request!(e)
       end
 
+      def flushed_write(bytes)
+        written = @sock.write(bytes)
+        @sock.flush
+        written
+      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, IOError => e
+        error_on_request!(e)
+      end
+
       # Non-blocking read.  Here to support the operation
       # of the get_multi operation
-      def read_nonblock
-        @sock.read_available
+      def read_available(...)
+        @sock.read_available(...)
       end
 
       def max_allowed_failures
@@ -240,7 +260,7 @@ module Dalli
       end
 
       def fork_detected?
-        @pid && @pid != PIDCache.pid
+        @pid && @pid != Process.pid
       end
 
       def log_down_detected
@@ -260,6 +280,22 @@ module Dalli
 
         time = Time.now - @down_at
         Dalli.logger.warn { format('%<name>s is back (downtime was %<time>.3f seconds)', name: name, time: time) }
+      end
+
+      private
+
+      # Reads exactly `count` bytes. IO#read(count) on a blocking socket blocks
+      # until it has `count` bytes, accumulating across TCP chunks internally,
+      # and only hands back a shorter (or nil) buffer when the stream hits EOF.
+      # So a short read means the peer closed mid-response: raise EOFError and
+      # let read's existing `rescue EOFError` route it through
+      # error_on_request!, which closes the dirty socket for a retry on a fresh
+      # connection (and preserves the $ERROR_INFO context down! relies on).
+      def read_bytes(count)
+        buffer = @sock.read(count)
+        return buffer if buffer && buffer.bytesize == count
+
+        raise EOFError, "EOF reading #{count} bytes; received #{buffer ? buffer.bytesize : 0}"
       end
     end
   end

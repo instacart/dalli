@@ -12,47 +12,62 @@ module Dalli
     # Common methods for all socket implementations.
     ##
     module InstanceMethods
-      def readfull(count)
-        value = String.new(capacity: count + 1)
-        loop do
-          result = read_nonblock(count - value.bytesize, exception: false)
-          value << result if append_to_buffer?(result)
-          break if value.bytesize == count
+      def read_available(reusable_buffer = nil)
+        if reusable_buffer
+          value = read_nonblock(8196, reusable_buffer, exception: false)
+          case value
+          when :wait_writable, :wait_readable
+            return reusable_buffer.clear
+          when nil
+            raise Errno::ECONNRESET, "Connection reset: #{logged_options.inspect}"
+          end
+        else
+          value = ''.b
         end
-        value
-      end
 
-      def read_available
-        value = +''
+        buffer = ''.b
         loop do
-          result = read_nonblock(8196, exception: false)
-          break if WAIT_RCS.include?(result)
-          raise Errno::ECONNRESET, "Connection reset: #{logged_options.inspect}" unless result
-
-          value << result
+          result = read_nonblock(8196, buffer, exception: false)
+          case result
+          when :wait_writable, :wait_readable
+            buffer.clear
+            return value
+          when nil
+            raise Errno::ECONNRESET, "Connection reset: #{logged_options.inspect}"
+          else
+            value << result
+          end
         end
-        value
-      end
-
-      WAIT_RCS = %i[wait_writable wait_readable].freeze
-
-      def append_to_buffer?(result)
-        raise Timeout::Error, "IO timeout: #{logged_options.inspect}" if nonblock_timed_out?(result)
-        raise Errno::ECONNRESET, "Connection reset: #{logged_options.inspect}" unless result
-
-        !WAIT_RCS.include?(result)
-      end
-
-      def nonblock_timed_out?(result)
-        return true if result == :wait_readable && !wait_readable(options[:socket_timeout])
-
-        # TODO: Do we actually need this?  Looks to be only used in read_nonblock
-        result == :wait_writable && !wait_writable(options[:socket_timeout])
       end
 
       FILTERED_OUT_OPTIONS = %i[username password].freeze
       def logged_options
         options.except(*FILTERED_OUT_OPTIONS)
+      end
+
+      # JRuby doesn't support IO#timeout=, so use custom readfull implementation
+      # CRuby 3.3+ has IO#timeout= which makes IO#read work with timeouts
+      if RUBY_ENGINE == 'jruby'
+        def readfull(count)
+          value = String.new(capacity: count + 1)
+
+          until value.bytesize == count
+            result = read_nonblock(count - value.bytesize, exception: false)
+            case result
+            when :wait_readable
+              wait_readable(options[:socket_timeout]) or raise Timeout::Error, "IO timeout: #{logged_options.inspect}"
+            when :wait_writable
+              wait_writable(options[:socket_timeout]) or raise Timeout::Error, "IO timeout: #{logged_options.inspect}"
+            when nil
+              raise Errno::ECONNRESET, "Connection reset: #{logged_options.inspect}"
+            else
+              value << result
+            end
+          end
+
+          value
+        end
+        # rubocop:enable Metrics/AbcSize
       end
     end
 
@@ -106,14 +121,19 @@ module Dalli
       end
 
       # Detect and cache whether TCPSocket supports the connect_timeout: keyword argument.
-      # Returns false if TCPSocket#initialize has been monkey-patched by gems like
-      # socksify or resolv-replace, which don't support keyword arguments.
+      # Returns true for an unmodified TCPSocket on Ruby 3.0+, or for resolv-replace >= 0.2.0
+      # which forwards keyword arguments through its patch.
+      # Returns false when monkey-patched by gems like socksify or resolv-replace < 0.2.0.
       # rubocop:disable ThreadSafety/ClassInstanceVariable
       def self.supports_connect_timeout?
         return @supports_connect_timeout if defined?(@supports_connect_timeout)
 
-        @supports_connect_timeout = RUBY_VERSION >= '3.0' &&
-                                    ::TCPSocket.instance_method(:initialize).parameters == TCPSOCKET_NATIVE_PARAMETERS
+        @supports_connect_timeout = RUBY_ENGINE == 'ruby' && RUBY_VERSION >= '3.0' &&
+                                    ::TCPSocket.instance_method(:initialize).parameters.then do |params|
+                                      params == TCPSOCKET_NATIVE_PARAMETERS || params.any? do |type, _|
+                                        type == :keyrest
+                                      end
+                                    end
       end
       # rubocop:enable ThreadSafety/ClassInstanceVariable
 
