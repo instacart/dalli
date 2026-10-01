@@ -4,6 +4,24 @@ Dalli Changelog
 Unreleased
 ==========
 
+3.2.10
+==========
+
+- Fix `Rack::Session::Dalli` with connection_pool 3.x, which only accepts keyword arguments (backport of #1051)
+- Add `logger` as a runtime dependency, since it is no longer a default gem as of Ruby 4.0 (backport of #1010, olleolleolle)
+- CI: patch memcached 1.5.22 so it builds on ubuntu-22.04, and run tests there (backport of #1033)
+
+3.2.9
+==========
+
+Security:
+
+- Fix memcached command injection through the `incr`/`decr` default with the meta protocol (GHSA-6wmv-xq9m-fmp7)
+  - With `protocol: :meta`, the `default` argument of `incr`/`decr` was written into the command without conversion, so a String containing CRLF injected additional memcached commands (e.g. `set`, `flush_all`) on the connection. The default binary protocol is not affected
+  - `default` must now be an Integer, or a String of decimal digits; anything else raises `ArgumentError` before a request is sent
+  - As defense in depth, the meta `RequestFormatter` now converts every numeric flag it writes (`D`, `J`, `N`, `T`) to an Integer
+  - Thanks to oss-security-shop for the report
+
 3.2.8
 ==========
 
