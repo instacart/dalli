@@ -4,13 +4,12 @@ on: [push, pull_request]
 
 jobs:
   test:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     strategy:
       fail-fast: false
       matrix:
         ruby-version:
-          - head
           - '3.3'
           - '3.2'
           - '3.1'
@@ -21,6 +20,7 @@ jobs:
           - jruby-9.4
         memcached-version: ['1.5.22', '1.6.23']
 
+    name: "Ruby ${{ matrix.ruby-version }} / Memcached ${{ matrix.memcached-version }}"
     steps:
     - uses: actions/checkout@v4
     - name: Install Memcached ${{ matrix.memcached-version }}
