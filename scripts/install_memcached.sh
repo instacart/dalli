@@ -5,6 +5,7 @@ set -euo pipefail
 version=$MEMCACHED_VERSION
 
 sudo apt-get -y remove memcached
+sudo apt-get update
 sudo apt-get install libevent-dev libsasl2-dev sasl2-bin
 
 echo Installing Memcached version ${version}
