@@ -4,6 +4,62 @@ Dalli Changelog
 Unreleased
 ==========
 
+3.2.13
+==========
+
+- Complete the fix for per-request `raw: true` on reads (GHSA-wr87-m4jw-29x5)
+  - `cas` and `cas!` accepted `raw: true` but didn't pass it to the read, so the value was still deserialized. They now honor it, in both protocols
+  - Affects 3.2.12 and earlier; fixed in 5.2.2, 5.1.4, 5.0.10, 4.3.7 and 3.2.13
+- Complete the fork-safety fix (GHSA-w39f-xq2m-4g8x)
+  - Fork detection used a pid cache refreshed by a `Process._fork` hook. When another library's fork hook ran first in the child (connection_pool, loaded before Dalli as in Rails, closes its connections there), Dalli didn't know it was in a forked child and ended the parent's TLS session. It now checks `Process.pid`
+  - Fixed in 4.3.7 and 3.2.13
+
+- Fix a regression in 3.2.12: a `get_multi` that didn't finish within `socket_timeout` counted toward `socket_max_failures`, so two slow `get_multi` calls in a row marked a healthy server down. It now just closes the connection
+- Handle malformed pipelined replies from a broken or hostile server or proxy: a hit with no key, or with no `s` flag, could leave the connection out of step or raise an error
+- With `decompressed_max_bytes` in effect, data after the end of a compressed value's stream was returned as part of the value. It's now ignored, as without the limit
+- With a `digest_class` whose digests aren't short hex strings, shortening a long key could loop forever. It now raises `ArgumentError`
+
+- Run the Tests and RuboCop workflows on pushes to `main` and the `*-stable` branches only, so a pull request's branch isn't tested twice (backport of #1198)
+
+3.2.12
+==========
+
+- Fix pipelined `get_multi` returning one key's value for another after an error reply (GHSA-p6pm-ch9v-44vx)
+  - The pipelined reply parser took any reply without a body for the end of the batch. An error reply for one key (`CLIENT_ERROR`, `SERVER_ERROR`, or `EN` from a proxy) ended it early, and the replies still on the connection were read as the replies to later commands, so a `get` could return another key's value
+  - Keys are now measured in bytes as sent (after base64 encoding when the meta protocol needs it). A key under 250 characters but over 250 bytes, for example one with many non-ASCII characters, passed validation:
+    - with the meta protocol, memcached rejected it with the error reply above
+    - with the binary protocol, memcached dropped the connection, and `get` or `get_multi` with that key retried forever
+  - Such keys are now truncated like other long keys; keys that worked before are unchanged
+  - The reply parser affects `protocol: :meta` since 3.2.0; the key length affects both protocols; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Stop retrying an unresponsive server forever (GHSA-4qp6-2jcr-596v)
+  - A server that accepted connections but never answered (or dropped the connection on a request) was retried forever, hanging the caller, because each successful reconnect reset the failure count. Requests now fail after `socket_max_failures` attempts and the server is marked down, as when it can't be reached at all; it gets a full set of attempts again after `down_retry_delay`
+  - Affects all versions; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Limit decompressed and reply value sizes (GHSA-3553-vcg5-72jw)
+  - Values flagged as compressed were inflated without limit, so a small stored value could expand to gigabytes on read, whatever the client's `compress` or `serializer` settings. The new `decompressed_max_bytes` option (default 128 MiB; `nil` disables it) makes a read that would pass it raise `Dalli::UnmarshalError`. Custom compressors whose `decompress` takes only the data keep working, without the limit
+  - The value size in a reply (a meta `VA` size or a binary body length) was used to read or buffer that many bytes, so a malicious server could make the client allocate gigabytes. Sizes over 1 GiB, memcached's largest item, now raise `Dalli::DalliError` before reading
+  - Affects all versions; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Honor per-request `raw: true` on reads, and add `Dalli::JSONSerializer` (GHSA-wr87-m4jw-29x5)
+  - `get`, `gat` and `fetch` ignored a per-request `raw: true` and deserialized the value according to its stored flags, so a caller who asked for raw bytes could still have `Marshal.load` run on data someone else wrote to memcached. They now return the stored bytes
+  - The `raw` part affects all versions
+  - `serializer: JSON` reads values with `JSON.load`, which on json gem versions before 3.0 creates an object of the class named in a stored `json_class` key when the json additions are loaded. The new `Dalli::JSONSerializer` reads with `JSON.parse` and only returns plain JSON types. The README now recommends it; `serializer: JSON` itself is unchanged
+  - The `serializer: JSON` part affects any version used with the json gem before 3.0
+- Keep a forked child from closing the parent's TLS session (GHSA-w39f-xq2m-4g8x)
+  - With TLS, a forked child that closed the client (or reconnected after detecting the fork) sent a TLS close on the connection the parent was still using, ending the parent's session. A forked child now closes only its own copy of the socket
+  - Affects all versions with TLS; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+
+- Fix three flaky tests: the `KeyManager` namespace key-length test, the Rack session freshness test, and `MemcachedManager`'s start and stop handling (backport of #1141, #1183)
+- Fix flaky failover tests: move their ports out of Linux's ephemeral port range, and wait for memcached to accept connections after starting it (backport of #1184)
+
+3.2.11
+==========
+
+- Fix multi-server `get_multi` stopping at an empty value (#1170)
+  - The pipelined reply parser took a hit on a zero-length value (`VA 0`) for the terminating `MN`, so that server's remaining keys were silently missing from the result
+  - Its value terminator and any replies not yet parsed stayed on the connection and were read as the replies to later commands on it. Those commands could fail with `Dalli::DalliError: Response error`, or a single-key `get` could silently return another key's value
+  - An empty value is now returned as `''`, like a single-key `get` and single-server `get_multi`
+  - Affects only clients using `protocol: :meta`; the default binary protocol is not affected
+  - Thanks to Julian Richard Contreras for this contribution
+
 3.2.10
 ==========
 

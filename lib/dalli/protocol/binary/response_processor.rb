@@ -66,7 +66,9 @@ module Dalli
           raise Dalli::DalliError, "Response error #{resp_header.status}: #{RESPONSE_CODES[resp_header.status]}"
         end
 
-        def get(cache_nils: false)
+        # raw: true returns the value as stored, without deserializing or
+        # decompressing it, whatever flags it was stored with
+        def get(cache_nils: false, raw: false)
           resp_header, body = read_response
 
           return false if resp_header.not_stored? # Not stored, normal status for add operation
@@ -75,7 +77,7 @@ module Dalli
           raise_on_not_ok!(resp_header)
           return true unless body
 
-          unpack_response_body(resp_header, body, true).last
+          unpack_response_body(resp_header, body, !raw).last
         end
 
         # returns [key, value]
@@ -121,7 +123,8 @@ module Dalli
           true
         end
 
-        def data_cas_response
+        # raw: true returns the value as stored; see #get
+        def data_cas_response(raw: false)
           resp_header, body = read_response
           return [nil, resp_header.cas] if resp_header.not_found?
           return [nil, false] if resp_header.not_stored?
@@ -129,7 +132,7 @@ module Dalli
           raise_on_not_ok!(resp_header)
           return [nil, resp_header.cas] unless body
 
-          [unpack_response_body(resp_header, body, true).last, resp_header.cas]
+          [unpack_response_body(resp_header, body, !raw).last, resp_header.cas]
         end
 
         # Returns the new value for the key, if found and updated
@@ -230,6 +233,17 @@ module Dalli
         # The remaining three values in the array are the ResponseHeader,
         # key, and value.
         ##
+        # memcached can't store an item larger than 1 GiB (its -I maximum). A
+        # pipelined reply claiming an impossible size would otherwise have the
+        # buffer wait for (and accumulate) that many bytes.
+        MAX_BODY_BYTES = 1024 * 1024 * 1024
+
+        def check_body_size!(size)
+          return if size <= MAX_BODY_BYTES
+
+          raise Dalli::DalliError, "Reply body size #{size} is out of range"
+        end
+
         def getk_response_from_buffer(buf)
           # There's no header in the buffer, so don't advance
           return [0, nil, nil, nil, nil] unless contains_header?(buf)
@@ -242,6 +256,8 @@ module Dalli
           # noop or, if the status is not zero, an intermediate
           # error response that needs to be discarded.
           return [ResponseHeader::SIZE, resp_header.ok?, resp_header.cas, nil, nil] if body_len.zero?
+
+          check_body_size!(body_len)
 
           resp_size = ResponseHeader::SIZE + body_len
           # The header is in the buffer, but the body is not.  As we don't have

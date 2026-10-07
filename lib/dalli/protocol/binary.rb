@@ -22,7 +22,7 @@ module Dalli
       def get(key, options = nil)
         req = RequestFormatter.standard_request(opkey: :get, key: key)
         write(req)
-        response_processor.get(cache_nils: cache_nils?(options))
+        response_processor.get(cache_nils: cache_nils?(options), raw: raw_request?(options))
       end
 
       def safe_get(key, options = nil)
@@ -41,7 +41,7 @@ module Dalli
         ttl = TtlSanitizer.sanitize(ttl)
         req = RequestFormatter.standard_request(opkey: :gat, key: key, ttl: ttl)
         write(req)
-        response_processor.get(cache_nils: cache_nils?(options))
+        response_processor.get(cache_nils: cache_nils?(options), raw: raw_request?(options))
       end
 
       def touch(key, ttl)
@@ -52,10 +52,10 @@ module Dalli
 
       # TODO: This is confusing, as there's a cas command in memcached
       # and this isn't it.  Maybe rename?  Maybe eliminate?
-      def cas(key)
+      def cas(key, options = nil)
         req = RequestFormatter.standard_request(opkey: :get, key: key)
         write(req)
-        response_processor.data_cas_response
+        response_processor.data_cas_response(raw: raw_request?(options))
       end
 
       # Storage Commands

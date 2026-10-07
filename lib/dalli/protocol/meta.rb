@@ -27,7 +27,7 @@ module Dalli
         encoded_key, base64 = KeyRegularizer.encode(key)
         req = RequestFormatter.meta_get(key: encoded_key, base64: base64)
         write(req)
-        response_processor.meta_get_with_value(cache_nils: cache_nils?(options))
+        response_processor.meta_get_with_value(cache_nils: cache_nils?(options), raw: raw_request?(options))
       end
 
       def quiet_get_request(key)
@@ -40,7 +40,7 @@ module Dalli
         encoded_key, base64 = KeyRegularizer.encode(key)
         req = RequestFormatter.meta_get(key: encoded_key, ttl: ttl, base64: base64)
         write(req)
-        response_processor.meta_get_with_value(cache_nils: cache_nils?(options))
+        response_processor.meta_get_with_value(cache_nils: cache_nils?(options), raw: raw_request?(options))
       end
 
       def touch(key, ttl)
@@ -53,11 +53,11 @@ module Dalli
 
       # TODO: This is confusing, as there's a cas command in memcached
       # and this isn't it.  Maybe rename?  Maybe eliminate?
-      def cas(key)
+      def cas(key, options = nil)
         encoded_key, base64 = KeyRegularizer.encode(key)
         req = RequestFormatter.meta_get(key: encoded_key, value: true, return_cas: true, base64: base64)
         write(req)
-        response_processor.meta_get_with_value_and_cas
+        response_processor.meta_get_with_value_and_cas(raw: raw_request?(options))
       end
 
       # Storage Commands

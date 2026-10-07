@@ -27,22 +27,27 @@ module Dalli
           @value_marshaller = value_marshaller
         end
 
-        def meta_get_with_value(cache_nils: false)
+        # raw: true returns the value as stored, without deserializing or
+        # decompressing it, whatever flags it was stored with
+        def meta_get_with_value(cache_nils: false, raw: false)
           tokens = error_on_unexpected!([VA, EN, HD])
           return cache_nils ? ::Dalli::NOT_FOUND : nil if tokens.first == EN
           return true unless tokens.first == VA
 
-          @value_marshaller.retrieve(read_line, bitflags_from_tokens(tokens))
+          value = read_line
+          raw ? value : @value_marshaller.retrieve(value, bitflags_from_tokens(tokens))
         end
 
-        def meta_get_with_value_and_cas
+        # raw: true returns the value as stored; see #meta_get_with_value
+        def meta_get_with_value_and_cas(raw: false)
           tokens = error_on_unexpected!([VA, EN, HD])
           return [nil, 0] if tokens.first == EN
 
           cas = cas_from_tokens(tokens)
           return [nil, cas] unless tokens.first == VA
 
-          [@value_marshaller.retrieve(read_line, bitflags_from_tokens(tokens)), cas]
+          value = read_line
+          [raw ? value : @value_marshaller.retrieve(value, bitflags_from_tokens(tokens)), cas]
         end
 
         def meta_get_without_value
@@ -120,6 +125,10 @@ module Dalli
         end
 
         def full_response_from_buffer(tokens, body, resp_size)
+          # A hit with no key can't be matched to a request: skip it (false
+          # status) rather than yield it, or take it for the end of the pipeline
+          return [resp_size, false, nil, nil, nil] unless tokens.any? { |t| t.start_with?('k') }
+
           value = @value_marshaller.retrieve(body, bitflags_from_tokens(tokens))
           [resp_size, tokens.first == VA, cas_from_tokens(tokens), key_from_tokens(tokens), value]
         end
@@ -140,11 +149,14 @@ module Dalli
 
           tokens, header_len, body_len = tokens_from_header_buffer(buf)
 
-          # We have a complete response that has no body.
-          # This is either the response to the terminating
-          # noop or, if the status is not MN, an intermediate
-          # error response that needs to be discarded.
-          return [header_len, true, nil, nil, nil] if body_len.zero?
+          # A complete response with no body. Only the terminating noop's MN
+          # ends the pipeline. Any other bodyless reply (CLIENT_ERROR,
+          # SERVER_ERROR, ...) answers one key's request: report it with a
+          # false status so the caller skips it and keeps reading. Treating it
+          # as the end would leave the remaining replies on the connection for
+          # later commands to read as their own. A hit on an empty value (VA 0)
+          # still has a body -- just its terminator -- so it's parsed below.
+          return [header_len, tokens.first == MN, nil, nil, nil] if no_body?(tokens, body_len)
 
           resp_size = header_len + body_len + TERMINATOR.length
           # The header is in the buffer, but the body is not.  As we don't have
@@ -155,6 +167,27 @@ module Dalli
           # the values
           body = buf.slice(header_len, body_len)
           full_response_from_buffer(tokens, body, resp_size)
+        end
+
+        # memcached can't store an item larger than 1 GiB (its -I maximum). A
+        # pipelined reply claiming an impossible size would otherwise have the
+        # buffer wait for (and accumulate) that many bytes.
+        MAX_VALUE_BYTES = 1024 * 1024 * 1024
+
+        # The size given right after "VA", or 0 when it isn't a number
+        def positional_size(tokens)
+          tokens.first == VA && tokens[1]&.match?(/\A\d+\z/) ? tokens[1].to_i : 0
+        end
+
+        def check_value_size!(size)
+          return if size.between?(0, MAX_VALUE_BYTES)
+
+          raise Dalli::DalliError, "Reply value size #{size} is out of range"
+        end
+
+        # A zero-size reply has no body unless it's a VA (a hit on an empty value)
+        def no_body?(tokens, body_len)
+          body_len.zero? && tokens.first != VA
         end
 
         def contains_header?(buf)
@@ -187,7 +220,11 @@ module Dalli
         end
 
         def body_len_from_tokens(tokens)
-          value_from_tokens(tokens, 's')&.to_i
+          # memcached also gives the size positionally ("VA <size> ..."); use it
+          # when there's no s flag rather than reading the value as replies
+          size = tokens.any? { |t| t.start_with?('s') } ? value_from_tokens(tokens, 's')&.to_i : positional_size(tokens)
+          check_value_size!(size) if size
+          size
         end
 
         def value_from_tokens(tokens, flag)

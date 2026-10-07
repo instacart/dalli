@@ -13,6 +13,92 @@ describe 'Network' do
           end
         end
 
+        # On this line the meta protocol's line reads rely on SO_RCVTIMEO,
+        # which some Rubies and platforms ignore, so a silent server can block
+        # the read itself rather than exercising the retries. Binary only.
+        if p == :binary
+          # Each retry used to reconnect successfully, which reset the failure
+          # count, so a server that accepts connections but never answers was
+          # retried forever and the caller hung.
+          it 'gives up on a server that accepts connections but never answers' do
+            server = TCPServer.new('127.0.0.1', 19_456)
+            acceptor = Thread.new do
+              loop do
+                Thread.new(server.accept) do |sock|
+                  while (line = sock.gets)
+                    sock.write("VERSION 1.6.45\r\n") if line.start_with?('version')
+                  end
+                rescue IOError, SystemCallError
+                  nil
+                end
+              end
+            rescue IOError
+              nil
+            end
+            dc = Dalli::Client.new('127.0.0.1:19456', socket_timeout: 0.3, protocol: p)
+            started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+            # The ring reports a server it has marked down as a RingError
+            assert_raises(Dalli::NetworkError, Dalli::RingError) { dc.get('anykey') }
+            assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 5
+          ensure
+            server&.close
+            acceptor&.kill
+          end
+        end
+
+        # The fake server below speaks the meta protocol
+        if p == :meta
+          # A get_multi that runs out of time overall isn't a socket failure, so
+          # slow ones in a row must not mark the server down.
+          it 'keeps a server that answers get_multi slowly' do
+            server = TCPServer.new('127.0.0.1', 19_459)
+            acceptor = Thread.new do
+              loop do
+                Thread.new(server.accept) do |sock|
+                  pending = []
+                  while (line = sock.gets)
+                    words = line.split
+                    case words.first
+                    when 'version' then sock.write("VERSION 1.6.45\r\n")
+                    when 'mg' then pending << words[1]
+                    when 'ms'
+                      sock.read(words[2].to_i + 2)
+                      sock.write("HD\r\n")
+                    when 'mn'
+                      first, *rest = pending
+                      sock.write("VA 1 f0 k#{first} s1\r\nv\r\n")
+                      sleep 0.5 # longer than the client's socket_timeout
+                      rest.each { |k| sock.write("VA 1 f0 k#{k} s1\r\nv\r\n") }
+                      sock.write("MN\r\n")
+                      pending.clear
+                    end
+                  end
+                rescue IOError, SystemCallError
+                  nil
+                end
+              end
+            rescue IOError
+              nil
+            end
+            dc = Dalli::Client.new('127.0.0.1:19459', socket_timeout: 0.3, protocol: p)
+
+            with_nil_logger do
+              3.times do
+                yielded = []
+                dc.get_multi('a', 'b', 'c') { |k, _| yielded << k }
+
+                assert_equal ['a'], yielded
+              end
+            end
+
+            assert dc.set('after', 'ok')
+          ensure
+            server&.close
+            acceptor&.kill
+          end
+        end
+
         describe 'with a fake server' do
           it 'handle connection reset' do
             memcached_mock(lambda(&:close)) do

@@ -27,6 +27,12 @@ module Dalli
         @connection_manager = ConnectionManager.new(hostname, port, socket_type, @options)
       end
 
+      # True when this request passed raw: true. A stored value is then
+      # returned as stored, never deserialized or decompressed.
+      def raw_request?(options)
+        options.is_a?(Hash) && options[:raw] ? true : false
+      end
+
       # Chokepoint method for error handling and ensuring liveness
       def request(opkey, *args)
         verify_state(opkey)
@@ -118,13 +124,16 @@ module Dalli
       def pipeline_abort
         response_buffer.clear
         @connection_manager.abort_request!
-        return true unless connected?
+        return unless connected?
 
-        # Closes the connection, which ensures that our connection
-        # is in a clean state for future requests
-        @connection_manager.error_on_request!('External timeout')
-      rescue NetworkError
-        true
+        # Closes the connection, which ensures that our connection is in a
+        # clean state for future requests. The get_multi ran out of time
+        # overall rather than hitting a socket error, so it doesn't count
+        # toward socket_max_failures: two slow get_multis in a row would
+        # otherwise mark a healthy server down.
+        Dalli.logger.warn { "#{name} didn't finish a get_multi within socket_timeout; closing the connection" }
+        @connection_manager.close
+        nil
       end
 
       # Did the last call to #pipeline_response_setup complete successfully?
