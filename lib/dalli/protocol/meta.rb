@@ -28,7 +28,7 @@ module Dalli
         skip_flags = raw_mode? || (options && options[:raw])
         req = RequestFormatter.meta_get(key: key, skip_flags: skip_flags)
         flushed_write(req)
-        response_processor.meta_get_with_value(cache_nils: cache_nils?(options))
+        response_processor.meta_get_with_value(cache_nils: cache_nils?(options), raw: raw_request?(options))
       end
 
       def safe_get(key, options = nil)
@@ -36,7 +36,7 @@ module Dalli
         req = RequestFormatter.meta_get(key: key, skip_flags: skip_flags, return_key: true)
         write(req)
         @connection_manager.flush
-        response_processor.meta_get_with_key(key, cache_nils: cache_nils?(options)).last
+        response_processor.meta_get_with_key(key, cache_nils: cache_nils?(options), raw: raw_request?(options)).last
       rescue Dalli::SocketCorruptionError => e
         error_on_request!(e)
       end
@@ -51,7 +51,7 @@ module Dalli
         skip_flags = raw_mode? || (options && options[:raw])
         req = RequestFormatter.meta_get(key: key, ttl: ttl, skip_flags: skip_flags)
         flushed_write(req)
-        response_processor.meta_get_with_value(cache_nils: cache_nils?(options))
+        response_processor.meta_get_with_value(cache_nils: cache_nils?(options), raw: raw_request?(options))
       end
 
       def touch(key, ttl)
@@ -63,10 +63,10 @@ module Dalli
 
       # TODO: This is confusing, as there's a cas command in memcached
       # and this isn't it.  Maybe rename?  Maybe eliminate?
-      def cas(key)
-        req = RequestFormatter.meta_get(key: key, value: true, return_cas: true)
+      def cas(key, options = nil)
+        req = RequestFormatter.meta_get(key: key, value: true, return_cas: true, skip_flags: raw_request?(options))
         flushed_write(req)
-        response_processor.meta_get_with_value_and_cas
+        response_processor.meta_get_with_value_and_cas(raw: raw_request?(options))
       end
 
       # Comprehensive meta get with support for all metadata flags.
@@ -95,7 +95,7 @@ module Dalli
       #   - :last_access - seconds since last access (only if return_last_access: true)
       def meta_get(key, options = {})
         req = RequestFormatter.meta_get(
-          key: key, value: true, return_cas: true,
+          key: key, value: true, return_cas: true, skip_flags: raw_request?(options),
           vivify_ttl: options[:vivify_ttl], recache_ttl: options[:recache_ttl],
           return_hit_status: options[:return_hit_status],
           return_last_access: options[:return_last_access], skip_lru_bump: options[:skip_lru_bump]
@@ -103,7 +103,7 @@ module Dalli
         flushed_write(req)
         response_processor.meta_get_with_metadata(
           cache_nils: cache_nils?(options), return_hit_status: options[:return_hit_status],
-          return_last_access: options[:return_last_access]
+          return_last_access: options[:return_last_access], raw: raw_request?(options)
         )
       end
 
@@ -163,7 +163,7 @@ module Dalli
         response_processor.meta_set_append_prepend unless quiet?
       end
 
-      # rubocop:disable Metrics/ParameterLists
+      # rubocop:disable-next Metrics/ParameterLists
       def write_append_prepend_req(mode, key, value, ttl = nil, cas = nil, _options = {})
         ttl = TtlSanitizer.sanitize(ttl) if ttl
         req = RequestFormatter.meta_set(key: key, value: value,
@@ -171,7 +171,6 @@ module Dalli
         write("#{req}#{value}#{TERMINATOR}")
         @connection_manager.flush unless quiet?
       end
-      # rubocop:enable Metrics/ParameterLists
 
       # Delete Commands
       def delete(key, cas)
@@ -269,7 +268,9 @@ module Dalli
 
       def parse_multi_get_value(line, key_index, is_raw)
         tokens = line.chomp!(TERMINATOR).split
-        value = @connection_manager.read(tokens[1].to_i + TERMINATOR.bytesize)&.chomp!(TERMINATOR)
+        size = tokens[1].to_i
+        response_processor.check_value_size!(size)
+        value = @connection_manager.read(size + TERMINATOR.bytesize)&.chomp!(TERMINATOR)
         raw_key = tokens[key_index]
         return unless raw_key
 

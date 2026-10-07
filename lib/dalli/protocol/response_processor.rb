@@ -23,6 +23,9 @@ module Dalli
         VERSION = 'VERSION'
         SERVER_ERROR = 'SERVER_ERROR'
 
+        # memcached can't store an item larger than 1 GiB (its -I maximum)
+        MAX_VALUE_BYTES = 1024 * 1024 * 1024
+
         T_OK = [OK].freeze
         T_RESET = [RESET].freeze
         T_EN_HD = [EN, HD].freeze
@@ -38,18 +41,21 @@ module Dalli
           @value_marshaller = value_marshaller
         end
 
-        def meta_get_with_value(cache_nils: false)
+        # raw: true (a request made with raw: true) returns the value as stored,
+        # ignoring any flags in the reply. The request didn't ask for flags, so
+        # a reply carrying them anyway must not get the value deserialized.
+        def meta_get_with_value(cache_nils: false, raw: false)
           tokens = error_on_unexpected!(T_VA_EN_HD)
           return cache_nils ? ::Dalli::NOT_FOUND : nil if tokens.first == EN
           return true unless tokens.first == VA
 
-          @value_marshaller.retrieve(read_data(tokens[1].to_i), bitflags_from_tokens(tokens))
+          retrieve(read_data(tokens[1].to_i), raw ? 0 : bitflags_from_tokens(tokens), raw)
         end
 
         # Returns [key, value] and validates that the response key matches the requested key.
         # Raises SocketCorruptionError if the keys don't match.
-        def meta_get_with_key(key, cache_nils: false)
-          tokens = error_on_unexpected!([VA, EN, HD])
+        def meta_get_with_key(key, cache_nils: false, raw: false)
+          tokens = error_on_unexpected!(T_VA_EN_HD)
           return cache_nils ? [key, ::Dalli::NOT_FOUND] : [key, nil] if tokens.first == EN
           return [key, true] unless tokens.first == VA
 
@@ -58,18 +64,18 @@ module Dalli
             raise Dalli::SocketCorruptionError, 'Socket corruption detected - key does not match response'
           end
 
-          value = @value_marshaller.retrieve(read_data(tokens[1].to_i), bitflags_from_tokens(tokens))
+          value = retrieve(read_data(tokens[1].to_i), raw ? 0 : bitflags_from_tokens(tokens), raw)
           [key, value]
         end
 
-        def meta_get_with_value_and_cas
+        def meta_get_with_value_and_cas(raw: false)
           tokens = error_on_unexpected!(T_VA_EN_HD)
           return [nil, 0] if tokens.first == EN
 
           cas = cas_from_tokens(tokens)
           return [nil, cas] unless tokens.first == VA
 
-          [@value_marshaller.retrieve(read_data(tokens[1].to_i), bitflags_from_tokens(tokens)), cas]
+          [retrieve(read_data(tokens[1].to_i), raw ? 0 : bitflags_from_tokens(tokens), raw), cas]
         end
 
         def meta_get_without_value
@@ -88,12 +94,13 @@ module Dalli
         #
         # Used by meta_get for comprehensive metadata retrieval.
         # Supports thundering herd protection (N/R flags) and metadata flags (h/l/u).
-        def meta_get_with_metadata(cache_nils: false, return_hit_status: false, return_last_access: false)
+        def meta_get_with_metadata(cache_nils: false, return_hit_status: false, return_last_access: false,
+                                   raw: false)
           tokens = error_on_unexpected!(T_VA_EN_HD)
           result = build_metadata_result(tokens)
           result[:hit_before] = hit_status_from_tokens(tokens) if return_hit_status
           result[:last_access] = last_access_from_tokens(tokens) if return_last_access
-          result[:value] = parse_value_from_tokens(tokens, cache_nils)
+          result[:value] = parse_value_from_tokens(tokens, cache_nils, raw)
           result
         end
 
@@ -105,11 +112,16 @@ module Dalli
           }
         end
 
-        def parse_value_from_tokens(tokens, cache_nils)
+        def parse_value_from_tokens(tokens, cache_nils, raw = false) # rubocop:disable Style/OptionalBooleanParameter
           return cache_nils ? ::Dalli::NOT_FOUND : nil if tokens.first == EN
           return unless tokens.first == VA
 
-          @value_marshaller.retrieve(read_data(tokens[1].to_i), bitflags_from_tokens(tokens))
+          retrieve(read_data(tokens[1].to_i), raw ? 0 : bitflags_from_tokens(tokens), raw)
+        end
+
+        # Values from a raw request are returned as stored
+        def retrieve(value, bitflags, raw)
+          raw ? value : @value_marshaller.retrieve(value, bitflags)
         end
 
         def meta_set_with_cas
@@ -191,6 +203,10 @@ module Dalli
         end
 
         def full_response_from_buffer(tokens, body, resp_size)
+          # A hit with no key can't be matched to a request: skip it (false
+          # status) rather than yield it, or take it for the end of the pipeline
+          return [false, resp_size] unless tokens.any? { |t| t.start_with?('k') }
+
           value = @value_marshaller.retrieve(body, bitflags_from_tokens(tokens))
           [tokens.first == VA, cas_from_tokens(tokens), key_from_tokens(tokens), value, resp_size]
         end
@@ -214,15 +230,21 @@ module Dalli
           tokens = header.split
           header_len = header.bytesize + TERMINATOR.length
 
-          # The body len is removed from the tokens array
-          body_len = body_len_from_tokens(tokens)
+          # The body len is removed from the tokens array. memcached also gives
+          # the size positionally ("VA <size> ..."); use it when there's no s
+          # flag rather than reading the value as replies.
+          body_len = tokens.any? { |t| t.start_with?('s') } ? body_len_from_tokens(tokens) : positional_size(tokens)
 
-          # We have a complete response that has no body.
-          # This is either the response to the terminating
-          # noop or, if the status is not MN, an intermediate
-          # error response that needs to be discarded.
-          return [true, header_len] if body_len.zero?
+          # A complete response with no body. Only the terminating noop's MN
+          # ends the pipeline. Any other bodyless reply (CLIENT_ERROR,
+          # SERVER_ERROR, ...) answers one key's request: report it with a
+          # false status so the caller skips it and keeps reading. Treating it
+          # as the end would leave the remaining replies on the connection for
+          # later commands to read as their own. A hit on an empty value (VA 0)
+          # still has a body -- just its terminator -- so it's parsed below.
+          return [tokens.first == MN, header_len] if body_len.zero? && tokens.first != VA
 
+          check_value_size!(body_len)
           resp_size = header_len + body_len + TERMINATOR.length
           # The header is in the buffer, but the body is not.  As we don't have
           # a complete response, don't advance the buffer
@@ -291,6 +313,19 @@ module Dalli
           end
         end
 
+        # A pipelined reply claiming an impossible size would otherwise have the
+        # buffer wait for (and accumulate) that many bytes
+        # The size given right after "VA", or 0 when it isn't a number
+        def positional_size(tokens)
+          tokens.first == VA && tokens[1]&.match?(/\A\d+\z/) ? tokens[1].to_i : 0
+        end
+
+        def check_value_size!(size)
+          return if size.between?(0, MAX_VALUE_BYTES)
+
+          raise Dalli::DalliError, "Reply value size #{size} is out of range"
+        end
+
         def read_line
           @io_source.read_line&.chomp!(TERMINATOR)
         end
@@ -301,6 +336,9 @@ module Dalli
         end
 
         def read_data(data_size)
+          # Checked before the terminator is added: -1 or -2 would otherwise
+          # read 1 or 0 bytes and leave the connection out of step
+          check_value_size!(data_size)
           @io_source.read(data_size + TERMINATOR.bytesize)&.chomp!(TERMINATOR)
         end
       end

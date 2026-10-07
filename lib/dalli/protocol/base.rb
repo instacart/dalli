@@ -36,6 +36,14 @@ module Dalli
         @raw_mode
       end
 
+      # True when values should come back as stored: the client is in raw mode,
+      # or this request passed raw: true. Retrieval paths use it to skip
+      # requesting flags, so a stored value is never deserialized or
+      # decompressed for a caller who asked for raw bytes.
+      def raw_request?(options)
+        raw_mode? || (options.is_a?(Hash) && options[:raw]) ? true : false
+      end
+
       # Chokepoint method for error handling and ensuring liveness
       def request(opkey, *args)
         verify_state(opkey)
@@ -114,7 +122,15 @@ module Dalli
         reconnect_on_pipeline_complete!
         values = nil
 
-        response_buffer.read
+        # Only the read is socket I/O. The caller's block runs below, outside
+        # this rescue, so an Errno or Timeout::Error it raises reaches the
+        # caller instead of being mistaken for a network failure (which closed
+        # the connection and retried the whole get_multi, yielding keys twice).
+        begin
+          response_buffer.read
+        rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError => e
+          @connection_manager.error_on_request!(e)
+        end
 
         status, cas, key, value = response_buffer.process_single_getk_response
         # status is not nil only if we have a full response to parse
@@ -140,8 +156,6 @@ module Dalli
         end
 
         values || {}
-      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError => e
-        @connection_manager.error_on_request!(e)
       end
       # rubocop:enable Metrics/AbcSize, Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
 
@@ -155,10 +169,13 @@ module Dalli
         @connection_manager.abort_request!
         return true unless connected?
 
-        # Closes the connection, which ensures that our connection
-        # is in a clean state for future requests
-        @connection_manager.error_on_request!('External timeout')
-      rescue NetworkError
+        # Closes the connection, which ensures that our connection is in a
+        # clean state for future requests. The get_multi ran out of time
+        # overall rather than hitting a socket error, so it doesn't count
+        # toward socket_max_failures: two slow get_multis in a row would
+        # otherwise mark a healthy server down.
+        Dalli.logger.warn { "#{name} didn't finish a get_multi within socket_timeout; closing the connection" }
+        @connection_manager.close
         true
       end
 

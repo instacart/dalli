@@ -18,3 +18,50 @@ describe 'Dalli::Compressor' do
                  ))
   end
 end
+
+# Decompressing with max_bytes stops as soon as the output passes the limit,
+# so a small compressed value can't expand into gigabytes of memory.
+[Dalli::Compressor, Dalli::GzipCompressor].each do |compressor|
+  describe "#{compressor}.decompress with max_bytes" do
+    let(:data) { 'abc' * 100_000 }
+    let(:compressed) { compressor.compress(data) }
+
+    it 'returns values within the limit unchanged' do
+      assert_equal data.b, compressor.decompress(compressed, max_bytes: data.bytesize).b
+    end
+
+    it 'raises UnmarshalError for values that decompress past the limit' do
+      error = assert_raises(Dalli::UnmarshalError) { compressor.decompress(compressed, max_bytes: 1024) }
+
+      assert_match(/exceeds 1024 bytes/, error.message)
+    end
+
+    it 'stops a decompression bomb without inflating it fully' do
+      bomb = compressor.compress("\0" * (16 * 1024 * 1024))
+
+      assert_raises(Dalli::UnmarshalError) { compressor.decompress(bomb, max_bytes: 1024 * 1024) }
+    end
+
+    # Bytes after the end of the compressed stream aren't part of the value,
+    # whichever path inflates it
+    it 'ignores data after the end of the stream, as without max_bytes' do
+      ["#{compressed}TRAILER", compressed + compressed, compressed + ('x' * 200_000)].each do |input|
+        assert_equal compressor.decompress(input).b, compressor.decompress(input, max_bytes: 10_000_000).b
+      end
+    end
+
+    it 'has no limit without max_bytes' do
+      assert_equal data.b, compressor.decompress(compressed).b
+    end
+
+    it 'inflates a value whose compressed form spans many input slices' do
+      # Random bytes barely compress, so this is several slices long
+      mixed = Random.new(42).bytes(300_000) + ('xyz' * 100_000)
+      packed = compressor.compress(mixed)
+
+      assert_operator packed.bytesize, :>, 4 * Dalli::Compressor::INFLATE_SLICE_BYTES
+      assert_equal mixed.b, compressor.decompress(packed, max_bytes: mixed.bytesize).b
+      assert_raises(Dalli::UnmarshalError) { compressor.decompress(packed, max_bytes: mixed.bytesize - 1) }
+    end
+  end
+end

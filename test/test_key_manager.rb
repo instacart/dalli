@@ -296,7 +296,12 @@ describe 'KeyManager' do
       end
 
       describe 'when the key with namespace is shorter than 250 characters' do
-        let(:keylen) { rand(250 - (half_namespace_len * 2)) + 1 }
+        # The stored key is "<namespace>:<key>", and KeyManager truncates when
+        # that exceeds 250 characters.  The namespace is SecureRandom.hex, so it
+        # is twice half_namespace_len; with the separator that leaves 249 - it
+        # for the key itself.  Generating up to 250 - it produced a 251
+        # character key roughly one run in 250, which truncated and failed.
+        let(:keylen) { rand(1..(249 - (half_namespace_len * 2))) }
         let(:alphanum) { [('a'..'z').to_a, ('A'..'Z').to_a, ('0'..'9').to_a].flatten }
         let(:key) { Array.new(keylen) { alphanum.sample }.join }
 
@@ -336,6 +341,55 @@ describe 'KeyManager' do
           end
         end
       end
+    end
+  end
+
+  # memcached's 250-byte limit applies to the key as sent: in bytes, and after
+  # base64 encoding for keys with whitespace or non-ASCII characters. A key
+  # within the limit in characters could still be rejected with CLIENT_ERROR.
+  describe 'validate_key wire length' do
+    let(:key_manager) { Dalli::KeyManager.new({}) }
+
+    def wire_bytes(key)
+      return key.bytesize unless Dalli::Protocol::Meta::KeyRegularizer.required?(key)
+
+      Dalli::Protocol::Meta::KeyRegularizer.encode(key).bytesize
+    end
+
+    it 'leaves keys that fit on the wire unchanged' do
+      # 186 raw bytes is the most that base64-encodes within 250 bytes
+      ['a' * 250, "#{'k' * 184} x", 'é' * 93].each do |key|
+        assert_equal key, key_manager.validate_key(key)
+      end
+    end
+
+    it 'truncates keys that are short enough in characters but too long once base64-encoded' do
+      ["search:#{'é' * 130}", 'é' * 250, "#{'k' * 185} x", ' ' * 260, '😀' * 100].each do |key|
+        validated = key_manager.validate_key(key)
+
+        refute_equal key, validated
+        assert_operator wire_bytes(validated), :<=, 250,
+                        "#{key[0, 20].inspect} is #{wire_bytes(validated)} bytes on the wire"
+        assert_includes validated, ':md5:'
+      end
+    end
+
+    it 'raises rather than looping or returning an over-long key for a digest that is too long' do
+      wide = Module.new { def self.hexdigest(_) = "\xFF".b * 200 }
+      long = Module.new { def self.hexdigest(_) = 'f' * 300 }
+
+      [wide, long].each do |digest|
+        manager = Dalli::KeyManager.new({ digest_class: digest })
+
+        assert_raises(ArgumentError) { Timeout.timeout(2) { manager.validate_key('a' * 300) } }
+      end
+    end
+
+    it 'gives different keys different truncated forms' do
+      a = key_manager.validate_key('é' * 200)
+      b = key_manager.validate_key("#{'é' * 199}è")
+
+      refute_equal a, b
     end
   end
 

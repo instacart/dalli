@@ -4,6 +4,85 @@ Dalli Changelog
 Unreleased
 ==========
 
+5.0.10
+==========
+
+Security:
+
+- Keep the caller's key when retrying a request (GHSA-m252-9cgf-vx2w)
+  - With a `namespace`, a request retried after a transient network error (a timeout, or a connection closed by memcached or a proxy) applied the namespace a second time, so a retried read could return a different key's value and a retried write could overwrite a different key
+  - Affects single-key operations since 5.0.3, and `get_with_metadata` and `fetch_with_lock` since 4.1.0; fixed in 5.2.2, 5.1.4, 5.0.10 and 4.3.7. Clients without a namespace aren't affected
+- Complete the fix for per-request `raw: true` on reads (GHSA-wr87-m4jw-29x5)
+  - `cas`, `cas!` and `fetch_with_lock` accepted `raw: true` but didn't pass it to the read, so the value was still deserialized. They now honor it
+  - A read made with `raw: true` doesn't ask for flags, but a reply carrying them anyway (from a proxy or a hostile server) still had its value deserialized. Raw reads now ignore flags in the reply
+  - Affects 5.0.9 and earlier; fixed in 5.2.2, 5.1.4, 5.0.10, 4.3.7 and 3.2.13
+
+Bug fixes:
+
+- `get_with_metadata` and `fetch_with_lock` retried the final error raised when a server is marked down, so with `down_retry_delay: 0` they retried an unresponsive server forever. They now retry only retryable errors, like other operations
+- Fix a regression in 5.0.9: a `get_multi` that didn't finish within `socket_timeout` counted toward `socket_max_failures`, so two slow `get_multi` calls in a row marked a healthy server down. It now just closes the connection
+- Fix a regression in 5.0.9: over TLS, every request buffered in a `quiet` block was sent as its own TLS record and system call (2.5 times slower for a block of 2000 deletes). Each flush is one write again
+- Handle malformed replies from a broken or hostile server or proxy: a negative value size, a hit with no key, or a hit with no `s` flag could leave the connection out of step or raise a non-Dalli error
+- With `decompressed_max_bytes` in effect, data after the end of a compressed value's stream was returned as part of the value. It's now ignored, as without the limit
+- With a `digest_class` whose digests aren't short hex strings, shortening a long key could loop forever. It now raises `ArgumentError`
+
+Development:
+
+- Run the Tests, RuboCop and Profiles workflows on pushes to `main` and the `*-stable` branches only, so a pull request's branch isn't tested twice (backport of #1198)
+
+5.0.9
+==========
+
+Security:
+
+- Fix pipelined `get_multi` returning one key's value for another after an error reply (GHSA-p6pm-ch9v-44vx)
+  - The pipelined reply parser took any reply without a body for the end of the batch. An error reply for one key (`CLIENT_ERROR`, `SERVER_ERROR`, or `EN` from a proxy) ended it early, and the replies still on the connection were read as the replies to later commands, so a `get` could return another key's value
+  - Keys are now measured in bytes as sent, after base64 encoding when the key needs it. A key under 250 characters but over 250 bytes on the wire (for example, one with many non-ASCII characters) was the easiest way to cause that error reply. Such keys are now truncated like other long keys; keys that worked before are unchanged
+  - Affects the meta protocol since 3.2.0 (the default since 5.0.0); fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Stop retrying an unresponsive server forever (GHSA-4qp6-2jcr-596v)
+  - A server that accepted connections but never answered (or dropped the connection on a request) was retried forever, hanging the caller, because each successful reconnect reset the failure count. Requests now fail after `socket_max_failures` attempts and the server is marked down, as when it can't be reached at all; it gets a full set of attempts again after `down_retry_delay`
+  - Affects all versions; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Limit decompressed and reply value sizes (GHSA-3553-vcg5-72jw)
+  - Values flagged as compressed were inflated without limit, so a small stored value could expand to gigabytes on read, whatever the client's `compress` or `serializer` settings. The new `decompressed_max_bytes` option (default 128 MiB; `nil` disables it) makes a read that would pass it raise `Dalli::UnmarshalError`. Custom compressors whose `decompress` takes only the data keep working, without the limit
+  - The value size in a reply was used to read or buffer that many bytes, so a malicious server could make the client allocate gigabytes. Sizes over 1 GiB, memcached's largest item, now raise `Dalli::DalliError` before reading
+  - Affects all versions; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Honor per-request `raw: true` on reads, and add `Dalli::JSONSerializer` (GHSA-wr87-m4jw-29x5)
+  - `get_with_metadata` ignored a per-request `raw: true` and deserialized the value according to its stored flags, so a caller who asked for raw bytes could still have `Marshal.load` run on data someone else wrote to memcached. They now return the stored bytes
+  - The `raw` part affects `get_with_metadata` since 4.2.0
+  - `serializer: JSON` reads values with `JSON.load`, which on json gem versions before 3.0 creates an object of the class named in a stored `json_class` key when the json additions are loaded. The new `Dalli::JSONSerializer` reads with `JSON.parse` and only returns plain JSON types. The README and the Marshal security warning now recommend it; `serializer: JSON` itself is unchanged
+  - The `serializer: JSON` part affects any version used with the json gem before 3.0
+- Keep a forked child from writing to or closing the parent's connection (GHSA-w39f-xq2m-4g8x)
+  - A child forked while the parent had requests buffered but not yet sent, such as quiet writes inside a `quiet` block, sent them again when it closed the client or reconnected: quiet writes ran twice, and the parent's later replies could be read as the replies to other requests, returning one key's value for another. Dalli now buffers requests itself and a forked child discards them
+  - Affects 4.2.0 and later; fixed in 5.2.1, 5.1.3, 5.0.9 and 4.3.6
+  - With TLS, a forked child that closed the client (or reconnected after detecting the fork) sent a TLS close on the connection the parent was still using, ending the parent's session. A forked child now closes only its own copy of the socket
+  - Affects all versions with TLS; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+
+Bug fixes:
+
+- An exception raised by a `get_multi` block (such as `Timeout::Error`) was treated as a network failure: swallowed, with the whole `get_multi` retried and keys yielded twice. It now reaches the caller
+
+Development:
+
+- Add property tests for request building and fuzz tests for the reply parsers
+- Fix three flaky tests: the `KeyManager` namespace key-length test, the Rack session freshness test, and `MemcachedManager`'s start and stop handling (backport of #1141, #1181)
+- Fix flaky failover tests: move their ports out of Linux's ephemeral port range, and wait for memcached to accept connections after starting it (backport of #1184)
+
+5.0.8
+==========
+
+Bug fixes:
+
+- Fix multi-server `get_multi` stopping at an empty value (#1170)
+  - The pipelined reply parser took a hit on a zero-length value (`VA 0`) for the terminating `MN`, so that server's remaining keys were silently missing from the result
+  - Its value terminator and any replies not yet parsed stayed on the connection and were read as the replies to later commands on it. Those commands could fail with `Dalli::DalliError: Response error`, or a single-key `get` could silently return another key's value
+  - An empty value is now returned as `''`, like a single-key `get` and single-server `get_multi`
+  - Affects the meta protocol since 3.2.0 (the default since 5.0.0)
+  - Thanks to Julian Richard Contreras for this contribution
+
+Development:
+
+- Fix offenses reported by RuboCop 1.91 and require `rubocop >= 1.91` (backport of #1162)
+
 5.0.7
 ==========
 

@@ -56,9 +56,42 @@ module MemcachedManager
       rescue Errno::ECHILD, Errno::ESRCH
         # Ignore errors
       end
-      sleep 0.1
+      @running_pids[key] = pid
+      confirm_started(pid, port_or_socket)
       pid
     end
+  end
+
+  # A fixed sleep after spawning was not proof the server was listening.  On a
+  # busy runner memcached could take longer, and the retry in
+  # start_and_flush_with_retry skips the flush that would have caught it.  A
+  # test's client then hit ECONNREFUSED on its first request and marked the
+  # server down for down_retry_delay (30s), so a "surviving" server in the
+  # failover tests was already unavailable before the other one was killed.
+  START_TIMEOUT_SECONDS = 5
+  def self.confirm_started(pid, port_or_socket)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + START_TIMEOUT_SECONDS
+    loop do
+      return if accepting?(port_or_socket)
+      raise "memcached for #{port_or_socket} exited before accepting connections" if Process.wait(pid, Process::WNOHANG)
+
+      if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        raise "memcached for #{port_or_socket} not accepting connections " \
+              "#{START_TIMEOUT_SECONDS}s after being started"
+      end
+
+      sleep 0.01
+    end
+  end
+
+  def self.accepting?(port_or_socket)
+    port = port_or_socket.to_i
+    return port_accepting?(port) unless port.zero?
+
+    UNIXSocket.new(port_or_socket).close
+    true
+  rescue SystemCallError
+    false
   end
 
   def self.stop(port_or_socket)
@@ -70,6 +103,8 @@ module MemcachedManager
     rescue Errno::ECHILD, Errno::ESRCH => e
       puts e.inspect
     end
+
+    confirm_stopped(port_or_socket)
   end
 
   def self.kill_and_wait(pid)
@@ -77,8 +112,49 @@ module MemcachedManager
     Process.wait(pid)
   end
 
+  # Tests that kill a server then assert on its absence depend on the port
+  # actually being free.  Reaping the pid is not on its own proof of that -- if
+  # some other process still holds the port, the client keeps getting answers
+  # and the assertion fails somewhere far from the cause.  Fail here instead,
+  # where the reason is obvious.
+  STOP_TIMEOUT_SECONDS = 5
+  def self.confirm_stopped(port_or_socket)
+    port = port_or_socket.to_i
+    return if port.zero? # UNIX socket; memcached removes the socket file itself
+
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + STOP_TIMEOUT_SECONDS
+    loop do
+      return unless port_accepting?(port)
+
+      if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        raise "memcached on port #{port} still accepting connections " \
+              "#{STOP_TIMEOUT_SECONDS}s after being stopped"
+      end
+
+      sleep 0.05
+    end
+  end
+
+  def self.port_accepting?(port)
+    TCPSocket.new('127.0.0.1', port).close
+    true
+  rescue SystemCallError
+    false
+  end
+
+  # A start that raised may still have spawned a process holding the port.
+  # Dropping the pid without killing it leaked that process: the port stayed
+  # bound, subsequent kills targeted a pid that no longer owned it, and tests
+  # asserting a server was gone found a live one.
   def self.failed_start(port_or_socket)
-    @running_pids[port_or_socket] = nil
+    pid = @running_pids.delete(port_or_socket)
+    return unless pid
+
+    begin
+      kill_and_wait(pid)
+    rescue Errno::ECHILD, Errno::ESRCH
+      nil
+    end
   end
 
   def self.parse_port_or_socket(port)
