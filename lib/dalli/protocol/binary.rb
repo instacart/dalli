@@ -28,7 +28,7 @@ module Dalli
       def safe_get(key, options = nil)
         req = RequestFormatter.standard_request(opkey: :getk, key: key)
         write(req)
-        response_processor.getk(key, cache_nils: cache_nils?(options)).last
+        response_processor.getk(key, cache_nils: cache_nils?(options), raw: raw_request?(options)).last
       rescue Dalli::SocketCorruptionError => e
         error_on_request!(e)
       end
