@@ -30,7 +30,7 @@ module Dalli
         req = RequestFormatter.meta_get(key: encoded_key, base64: base64, skip_flags: skip_flags)
         write(req)
         @connection_manager.flush
-        response_processor.meta_get_with_value(cache_nils: cache_nils?(options))
+        response_processor.meta_get_with_value(cache_nils: cache_nils?(options), raw: raw_request?(options))
       end
 
       def quiet_get_request(key)
@@ -47,7 +47,7 @@ module Dalli
         req = RequestFormatter.meta_get(key: encoded_key, ttl: ttl, base64: base64, skip_flags: skip_flags)
         write(req)
         @connection_manager.flush
-        response_processor.meta_get_with_value(cache_nils: cache_nils?(options))
+        response_processor.meta_get_with_value(cache_nils: cache_nils?(options), raw: raw_request?(options))
       end
 
       def touch(key, ttl)
@@ -61,12 +61,13 @@ module Dalli
 
       # TODO: This is confusing, as there's a cas command in memcached
       # and this isn't it.  Maybe rename?  Maybe eliminate?
-      def cas(key)
+      def cas(key, options = nil)
         encoded_key, base64 = KeyRegularizer.encode(key)
-        req = RequestFormatter.meta_get(key: encoded_key, value: true, return_cas: true, base64: base64)
+        req = RequestFormatter.meta_get(key: encoded_key, value: true, return_cas: true, base64: base64,
+                                        skip_flags: raw_request?(options))
         write(req)
         @connection_manager.flush
-        response_processor.meta_get_with_value_and_cas
+        response_processor.meta_get_with_value_and_cas(raw: raw_request?(options))
       end
 
       # Comprehensive meta get with support for all metadata flags.
@@ -96,7 +97,7 @@ module Dalli
       def meta_get(key, options = {})
         encoded_key, base64 = KeyRegularizer.encode(key)
         req = RequestFormatter.meta_get(
-          key: encoded_key, value: true, return_cas: true, base64: base64,
+          key: encoded_key, value: true, return_cas: true, base64: base64, skip_flags: raw_request?(options),
           vivify_ttl: options[:vivify_ttl], recache_ttl: options[:recache_ttl],
           return_hit_status: options[:return_hit_status],
           return_last_access: options[:return_last_access], skip_lru_bump: options[:skip_lru_bump]
@@ -105,7 +106,7 @@ module Dalli
         @connection_manager.flush
         response_processor.meta_get_with_metadata(
           cache_nils: cache_nils?(options), return_hit_status: options[:return_hit_status],
-          return_last_access: options[:return_last_access]
+          return_last_access: options[:return_last_access], raw: raw_request?(options)
         )
       end
 
@@ -146,7 +147,7 @@ module Dalli
         response_processor.meta_set_with_cas unless quiet?
       end
 
-      # rubocop:disable Metrics/ParameterLists
+      # rubocop:disable-next Metrics/ParameterLists
       def write_storage_req(mode, key, raw_value, ttl = nil, cas = nil, options = {}, quiet: quiet?)
         (value, bitflags) = @value_marshaller.store(key, raw_value, options)
         ttl = TtlSanitizer.sanitize(ttl) if ttl
@@ -159,7 +160,6 @@ module Dalli
         write(TERMINATOR)
         @connection_manager.flush unless quiet
       end
-      # rubocop:enable Metrics/ParameterLists
 
       def append(key, value)
         write_append_prepend_req(:append, key, value)
@@ -171,7 +171,7 @@ module Dalli
         response_processor.meta_set_append_prepend unless quiet?
       end
 
-      # rubocop:disable Metrics/ParameterLists
+      # rubocop:disable-next Metrics/ParameterLists
       def write_append_prepend_req(mode, key, value, ttl = nil, cas = nil, _options = {})
         ttl = TtlSanitizer.sanitize(ttl) if ttl
         encoded_key, base64 = KeyRegularizer.encode(key)
@@ -182,7 +182,6 @@ module Dalli
         write(TERMINATOR)
         @connection_manager.flush unless quiet?
       end
-      # rubocop:enable Metrics/ParameterLists
 
       # Delete Commands
       def delete(key, cas)

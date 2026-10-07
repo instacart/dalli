@@ -7,7 +7,7 @@ describe Dalli::Protocol::Binary::ResponseProcessor do
   # Format: magic(1) + opcode(1) + key_len(2) + extra_len(1) + data_type(1) +
   #         status(2) + body_len(4) + opaque(4) + cas(8)
   # Note: CAS uses native endian (Q) to match ResponseHeader's FMT = '@2nCCnNNQ'
-  # rubocop:disable Metrics/ParameterLists
+  # rubocop:disable-next Metrics/ParameterLists
   def create_header(status: 0, key_len: 0, extra_len: 0, body_len: 0, cas: 0, opaque: 0)
     [
       0x81,        # magic (response)
@@ -21,7 +21,6 @@ describe Dalli::Protocol::Binary::ResponseProcessor do
       cas          # CAS (native endian)
     ].pack('CCnCCnNNQ')
   end
-  # rubocop:enable Metrics/ParameterLists
 
   let(:io_source) { Minitest::Mock.new }
   let(:value_marshaller) { Dalli::Protocol::ValueMarshaller.new({}) }
@@ -264,6 +263,12 @@ describe Dalli::Protocol::Binary::ResponseProcessor do
   end
 
   describe '#getk_response_from_buffer' do
+    it 'rejects a pipelined reply that claims an impossible body size' do
+      header = create_header(status: 0, key_len: 3, extra_len: 4, body_len: 0xFFFF_FFFF)
+
+      assert_raises(Dalli::DalliError) { processor.getk_response_from_buffer(header) }
+    end
+
     it 'returns [0, nil, nil, nil, nil] when buffer is too small for header' do
       small_buf = 'x' * 10
       result = processor.getk_response_from_buffer(small_buf)

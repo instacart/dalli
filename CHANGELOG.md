@@ -4,6 +4,100 @@ Dalli Changelog
 Unreleased
 ==========
 
+4.3.7
+==========
+
+Security:
+
+- Keep the caller's key when retrying a request (GHSA-m252-9cgf-vx2w)
+  - With a `namespace`, a request retried after a transient network error (a timeout, or a connection closed by memcached or a proxy) applied the namespace a second time, so a retried read could return a different key's value and a retried write could overwrite a different key
+  - Affects `get_with_metadata` and `fetch_with_lock` since 4.1.0 (single-key operations on 4.x aren't affected); fixed in 5.2.2, 5.1.4, 5.0.10 and 4.3.7. Clients without a namespace aren't affected
+- Complete the fix for per-request `raw: true` on reads (GHSA-wr87-m4jw-29x5)
+  - `cas` and `cas!` (both protocols) and `fetch_with_lock` (meta protocol) accepted `raw: true` but didn't pass it to the read, so the value was still deserialized. They now honor it
+  - A read made with `raw: true` doesn't ask for flags, but a reply carrying them anyway (from a proxy or a hostile server) still had its value deserialized. Meta protocol raw reads now ignore flags in the reply
+  - Affects 4.3.6 and earlier; fixed in 5.2.2, 5.1.4, 5.0.10, 4.3.7 and 3.2.13
+- Complete the fork-safety fix (GHSA-w39f-xq2m-4g8x)
+  - Fork detection used a pid cache refreshed by a `Process._fork` hook. When another library's fork hook ran first in the child (connection_pool, loaded before Dalli as in Rails, closes its connections there), Dalli didn't know it was in a forked child and ended the parent's TLS session. It now checks `Process.pid`
+  - 4.3.6's write buffer kept a reference to the caller's value string with the meta protocol, so changing the string before the buffer was sent (for example, reusing one buffer inside a `quiet` block) changed the bytes sent, losing values or adding commands. The buffer now holds a copy
+  - Fixed in 4.3.7 and 3.2.13
+
+Bug fixes:
+
+- `get_with_metadata` and `fetch_with_lock` retried the final error raised when a server is marked down, so with `down_retry_delay: 0` they retried an unresponsive server forever. They now retry only retryable errors, like other operations
+- Fix a regression in 4.3.6: a `get_multi` that didn't finish within `socket_timeout` counted toward `socket_max_failures`, so two slow `get_multi` calls in a row marked a healthy server down. It now just closes the connection
+- Fix a regression in 4.3.6: over TLS, every request buffered in a `quiet` block was sent as its own TLS record and system call (2.5 times slower for a block of 2000 deletes). Each flush is one write again
+- Handle malformed replies from a broken or hostile server or proxy: a negative value size, a hit with no key, or a hit with no `s` flag could leave the connection out of step or raise a non-Dalli error
+- With `decompressed_max_bytes` in effect, data after the end of a compressed value's stream was returned as part of the value. It's now ignored, as without the limit
+- With a `digest_class` whose digests aren't short hex strings, shortening a long key could loop forever. It now raises `ArgumentError`
+
+Development:
+
+- Run the Tests, RuboCop and Profiles workflows on pushes to `main` and the `*-stable` branches only, so a pull request's branch isn't tested twice (backport of #1198)
+
+4.3.6
+==========
+
+Security:
+
+- Fix pipelined `get_multi` returning one key's value for another after an error reply (GHSA-p6pm-ch9v-44vx)
+  - The pipelined reply parser took any reply without a body for the end of the batch. An error reply for one key (`CLIENT_ERROR`, `SERVER_ERROR`, or `EN` from a proxy) ended it early, and the replies still on the connection were read as the replies to later commands, so a `get` could return another key's value
+  - Keys are now measured in bytes as sent (after base64 encoding when the meta protocol needs it). A key under 250 characters but over 250 bytes, for example one with many non-ASCII characters, passed validation:
+    - with the meta protocol, memcached rejected it with the error reply above
+    - with the binary protocol, memcached dropped the connection, and `get` or `get_multi` with that key retried forever
+  - Such keys are now truncated like other long keys; keys that worked before are unchanged
+  - The reply parser affects `protocol: :meta` since 3.2.0; the key length affects both protocols; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Stop retrying an unresponsive server forever (GHSA-4qp6-2jcr-596v)
+  - A server that accepted connections but never answered (or dropped the connection on a request) was retried forever, hanging the caller, because each successful reconnect reset the failure count. Requests now fail after `socket_max_failures` attempts and the server is marked down, as when it can't be reached at all; it gets a full set of attempts again after `down_retry_delay`
+  - Affects all versions; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Limit decompressed and reply value sizes (GHSA-3553-vcg5-72jw)
+  - Values flagged as compressed were inflated without limit, so a small stored value could expand to gigabytes on read, whatever the client's `compress` or `serializer` settings. The new `decompressed_max_bytes` option (default 128 MiB; `nil` disables it) makes a read that would pass it raise `Dalli::UnmarshalError`. Custom compressors whose `decompress` takes only the data keep working, without the limit
+  - The value size in a reply (a meta `VA` size or a binary body length) was used to read or buffer that many bytes, so a malicious server could make the client allocate gigabytes. Sizes over 1 GiB, memcached's largest item, now raise `Dalli::DalliError` before reading
+  - Affects all versions; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+- Honor per-request `raw: true` on reads, and add `Dalli::JSONSerializer` (GHSA-wr87-m4jw-29x5)
+  - With the binary protocol, `get`, `gat` and `fetch`, and with the meta protocol, `get_with_metadata`, ignored a per-request `raw: true` and deserialized the value according to its stored flags, so a caller who asked for raw bytes could still have `Marshal.load` run on data someone else wrote to memcached. They now return the stored bytes
+  - The `raw` part affects binary `get` and `gat` in all versions, and `get_with_metadata` since 4.2.0
+  - `serializer: JSON` reads values with `JSON.load`, which on json gem versions before 3.0 creates an object of the class named in a stored `json_class` key when the json additions are loaded. The new `Dalli::JSONSerializer` reads with `JSON.parse` and only returns plain JSON types. The README and the Marshal security warning now recommend it; `serializer: JSON` itself is unchanged
+  - The `serializer: JSON` part affects any version used with the json gem before 3.0
+- Keep a forked child from writing to or closing the parent's connection (GHSA-w39f-xq2m-4g8x)
+  - A child forked while the parent had requests buffered but not yet sent, such as quiet writes inside a `quiet` block, sent them again when it closed the client or reconnected: quiet writes ran twice, and the parent's later replies could be read as the replies to other requests, returning one key's value for another. Dalli now buffers requests itself and a forked child discards them
+  - Affects 4.2.0 and later; fixed in 5.2.1, 5.1.3, 5.0.9 and 4.3.6
+  - With TLS, a forked child that closed the client (or reconnected after detecting the fork) sent a TLS close on the connection the parent was still using, ending the parent's session. A forked child now closes only its own copy of the socket
+  - Affects all versions with TLS; fixed in 5.2.1, 5.1.3, 5.0.9, 4.3.6 and 3.2.12
+
+Bug fixes:
+
+- An exception raised by a `get_multi` block (such as `Timeout::Error`) was treated as a network failure: swallowed, with the whole `get_multi` retried and keys yielded twice. It now reaches the caller
+- Fix `set_multi` with the binary protocol
+  - Each quiet `setq` waited for a reply memcached never sends for a successful write, so `set_multi` timed out on its first key without storing anything (and, with retries, hung or marked the server down). Affects 4.2.0 and later
+
+Notes:
+
+- Document [Ruby bug 21195](https://bugs.ruby-lang.org/issues/21195), a VM crash (`[BUG] rb_sys_fail_path_in(io_fillbuf, ...) - errno == 0`) when a socket read using `IO#timeout` is interrupted by a signal, in the README (#1188)
+  - Affects Ruby 3.2.x, 3.3.0–3.3.7 and 3.4.0–3.4.2. Fixed in 3.3.8 and 3.4.3; Ruby 3.2 reached end of life without the fix
+  - Ruby 3.1 doesn't use `IO#timeout` and isn't affected
+
+Development:
+
+- Drop Ruby 3.2 from the CI matrix, since that bug intermittently crashed its test runs (#1188)
+- Fix three flaky tests: the `KeyManager` namespace key-length test, the Rack session freshness test, and `MemcachedManager`'s start and stop handling (backport of #1141, #1182)
+- Fix flaky failover tests: move their ports out of Linux's ephemeral port range, and wait for memcached to accept connections after starting it (backport of #1184)
+
+4.3.5
+==========
+
+Bug fixes:
+
+- Fix multi-server `get_multi` stopping at an empty value (#1170)
+  - The pipelined reply parser took a hit on a zero-length value (`VA 0`) for the terminating `MN`, so that server's remaining keys were silently missing from the result
+  - Its value terminator and any replies not yet parsed stayed on the connection and were read as the replies to later commands on it. Those commands could fail with `Dalli::DalliError: Response error`, or a single-key `get` could silently return another key's value
+  - An empty value is now returned as `''`, like a single-key `get` and single-server `get_multi`
+  - Affects only clients using `protocol: :meta`; the default binary protocol is not affected
+  - Thanks to Julian Richard Contreras for this contribution
+
+Development:
+
+- Fix offenses reported by RuboCop 1.91 and require `rubocop >= 1.91` (backport of #1162)
+
 4.3.4
 ==========
 

@@ -20,6 +20,18 @@ The name is a variant of Salvador Dali for his famous painting [The Persistence 
 * Ruby 3.1 or later
 * memcached 1.4 or later (1.6+ recommended for meta protocol support)
 
+### Known Ruby issue: crash on an interrupted socket read
+
+On Ruby 3.2 and later, Dalli sets socket timeouts with `IO#timeout`. Ruby 3.2.x, 3.3.0–3.3.7 and 3.4.0–3.4.2 have a bug ([Ruby #21195](https://bugs.ruby-lang.org/issues/21195)) where a timed read interrupted by a signal aborts the whole process:
+
+```
+[BUG] rb_sys_fail_path_in(io_fillbuf, fd:N ) - errno == 0
+```
+
+The crash is inside Ruby itself, so it can't be rescued. It was fixed in Ruby 3.3.8 and 3.4.3. Ruby 3.2 reached end of life without the fix. If you see this crash, upgrade to Ruby 3.3.8+ or 3.4.3+. Ruby 3.1 doesn't use `IO#timeout` and isn't affected.
+
+Ruby 3.2 is no longer part of this branch's CI matrix for the same reason.
+
 ## Protocol Options
 
 Dalli supports two protocols for communicating with memcached:
@@ -61,8 +73,12 @@ The separator must be a single non-alphanumeric character. Valid examples: `:`, 
 By default, Dalli uses Ruby's Marshal for serialization. Deserializing untrusted data with Marshal can lead to remote code execution. If you cache user-controlled data, consider using a safer serializer:
 
 ```ruby
-Dalli::Client.new('localhost:11211', serializer: JSON)
+Dalli::Client.new('localhost:11211', serializer: Dalli::JSONSerializer)
 ```
+
+`Dalli::JSONSerializer` reads values with `JSON.parse`, so it only ever returns plain hashes, arrays, strings, numbers, booleans and `nil`. Passing the `JSON` module itself (`serializer: JSON`) reads values with `JSON.load`, which can create objects of other classes from a stored `json_class` key and is not recommended for data an attacker might write.
+
+Per-request `raw: true` returns the stored bytes without deserializing or decompressing them, on every read method that accepts it (`get`, `get_with_metadata` and `fetch`).
 
 See the [4.0-Upgrade.md](4.0-Upgrade.md) guide for more information.
 

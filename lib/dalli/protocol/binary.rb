@@ -23,7 +23,7 @@ module Dalli
         req = RequestFormatter.standard_request(opkey: :get, key: key)
         write(req)
         @connection_manager.flush
-        response_processor.get(cache_nils: cache_nils?(options))
+        response_processor.get(cache_nils: cache_nils?(options), raw: raw_request?(options))
       end
 
       def safe_get(key, options = nil)
@@ -44,7 +44,7 @@ module Dalli
         req = RequestFormatter.standard_request(opkey: :gat, key: key, ttl: ttl)
         write(req)
         @connection_manager.flush
-        response_processor.get(cache_nils: cache_nils?(options))
+        response_processor.get(cache_nils: cache_nils?(options), raw: raw_request?(options))
       end
 
       def touch(key, ttl)
@@ -56,11 +56,11 @@ module Dalli
 
       # TODO: This is confusing, as there's a cas command in memcached
       # and this isn't it.  Maybe rename?  Maybe eliminate?
-      def cas(key)
+      def cas(key, options = nil)
         req = RequestFormatter.standard_request(opkey: :get, key: key)
         write(req)
         @connection_manager.flush
-        response_processor.data_cas_response
+        response_processor.data_cas_response(raw: raw_request?(options))
       end
 
       # Storage Commands
@@ -72,7 +72,7 @@ module Dalli
       # Pipelined set - writes a quiet set request without reading response.
       # Used by PipelinedSetter for bulk operations.
       def pipelined_set(key, value, ttl, options)
-        storage_req(:setq, key, value, ttl, 0, options)
+        storage_req(:setq, key, value, ttl, 0, options, quiet: true)
       end
 
       def add(key, value, ttl, options)
@@ -85,8 +85,8 @@ module Dalli
         storage_req(opkey, key, value, ttl, cas, options)
       end
 
-      # rubocop:disable Metrics/ParameterLists
-      def storage_req(opkey, key, value, ttl, cas, options)
+      # rubocop:disable-next Metrics/ParameterLists
+      def storage_req(opkey, key, value, ttl, cas, options, quiet: quiet?)
         (value, bitflags) = @value_marshaller.store(key, value, options)
         ttl = TtlSanitizer.sanitize(ttl)
 
@@ -94,10 +94,9 @@ module Dalli
                                                 value: value, bitflags: bitflags,
                                                 ttl: ttl, cas: cas)
         write(req)
-        @connection_manager.flush unless quiet?
-        response_processor.storage_response unless quiet?
+        @connection_manager.flush unless quiet
+        response_processor.storage_response unless quiet
       end
-      # rubocop:enable Metrics/ParameterLists
 
       def append(key, value)
         opkey = quiet? ? :appendq : :append
