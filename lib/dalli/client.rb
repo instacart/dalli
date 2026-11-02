@@ -45,13 +45,19 @@ module Dalli
     #                   useful for injecting a FIPS compliant hash object.
     # - :protocol - one of either :binary or :meta, defaulting to :binary.  This sets the protocol that Dalli uses
     #               to communicate with memcached.
+    # - :verify_reply_keys - defaults to false. When true, get_multi only accepts replies for the keys it requested;
+    #                        after a reply naming another key, the rest of that server's replies are treated as misses.
+    #                        With the meta protocol, memcached can name an item by its raw key bytes when the item was
+    #                        created by auto-create from a base64-encoded key, which Dalli no longer does. Costs a
+    #                        multi-get about 15%.
     #
     def initialize(servers = nil, options = {})
       @normalized_servers = ::Dalli::ServersArgNormalizer.normalize_servers(servers)
       @options = normalize_options(options)
 
       if !@options[:protocol].nil? && @options[:protocol] != :binary
-        raise NotImplementedError, "This fork does not support the #{@options[:protocol]} protocol because safe_get is not implemented"
+        raise NotImplementedError,
+              "This fork does not support the #{@options[:protocol]} protocol because safe_get is not implemented"
       end
 
       @key_manager = ::Dalli::KeyManager.new(@options)
@@ -192,6 +198,11 @@ module Dalli
     # Any error replies will be discarded at the end of the block, and
     # Dalli client methods invoked inside the block will not
     # have return values
+    #
+    # The block is quiet only for the thread or fiber that runs it. Another
+    # thread or fiber sharing this client can make requests meanwhile; a
+    # non-quiet one first reads the block's pending replies with a noop and
+    # discards them, so it reads only its own.
     def quiet
       old = Thread.current[::Dalli::QUIET]
       Thread.current[::Dalli::QUIET] = true

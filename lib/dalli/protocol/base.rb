@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'forwardable'
+require 'set'
 require 'socket'
 require 'timeout'
 
@@ -23,6 +24,7 @@ module Dalli
       def initialize(attribs, client_options = {})
         hostname, port, socket_type, @weight, user_creds = ServerConfigParser.parse(attribs)
         @options = client_options.merge(user_creds)
+        @verify_reply_keys = client_options[:verify_reply_keys] ? true : false
         @value_marshaller = ValueMarshaller.new(@options)
         @connection_manager = ConnectionManager.new(hostname, port, socket_type, @options)
       end
@@ -39,7 +41,11 @@ module Dalli
 
         begin
           @connection_manager.start_request!
+          drain_pending_quiet_responses(opkey)
           response = send(opkey, *args)
+          # Quiet requests can leave replies on the socket; remember that so a
+          # later non-quiet request knows to read them first
+          @connection_manager.quiet_responses_pending = true if quiet? && opkey != :noop
 
           # pipelined_get emit query but doesn't read the response(s)
           @connection_manager.finish_request! unless opkey == :pipelined_get
@@ -105,7 +111,7 @@ module Dalli
 
           # If the status is ok and the key is not nil, then this is a
           # getkq response with a value that we want to set in the response hash
-          values[key] = [value, cas] unless key.nil?
+          break unless keep_reading?(values, key, value, cas)
 
           # Get the next response from the buffer
           status, cas, key, value = response_buffer.process_single_getk_response
@@ -163,6 +169,18 @@ module Dalli
       private
 
       ALLOWED_QUIET_OPS = %i[add replace set delete incr decr append prepend flush noop].freeze
+
+      # Reads the replies still pending from quiet requests before any
+      # non-quiet request, which reads a reply of its own. A quiet block reads
+      # them at its end, but the connection is shared: another thread or fiber
+      # (quiet? is fiber-local) can make a request while the block is still
+      # open, and would otherwise read the block's replies as its own.
+      def drain_pending_quiet_responses(opkey)
+        return unless @connection_manager.quiet_responses_pending? && opkey != :noop && !quiet?
+
+        noop
+      end
+
       def verify_allowed_quiet!(opkey)
         return if ALLOWED_QUIET_OPS.include?(opkey)
 
@@ -220,6 +238,7 @@ module Dalli
       end
 
       def pipelined_get(keys)
+        expect_reply_keys(keys)
         req = +''
         keys.each do |key|
           req << quiet_get_request(key)
@@ -230,6 +249,50 @@ module Dalli
 
       def response_buffer
         @response_buffer ||= ResponseBuffer.new(@connection_manager, response_processor)
+      end
+
+      # A multi-get only accepts replies for the keys it asked for. With the
+      # meta protocol, memcached names an item created by auto-create (ma or mg
+      # with N) for a base64-encoded key by its raw bytes, without the b flag;
+      # such a key can contain spaces or CR/LF, which split the reply header and
+      # make the replies after it parse as different ones. A key that wasn't
+      # requested is how that shows up. Only with the verify_reply_keys option,
+      # since building the set costs a multi-get about 15%.
+      def expect_reply_keys(keys)
+        @expected_reply_keys = (keys.to_set { |k| reply_key_form(k) } if @verify_reply_keys)
+      end
+
+      # Stores a getkq reply's value and returns true, unless its key wasn't
+      # requested: then the replies are out of step, so what was read so far is
+      # kept, the rest dropped, and false returned to stop reading
+      def keep_reading?(values, key, value, cas)
+        return true if key.nil?
+
+        if unexpected_reply_key?(key)
+          abandon_pipeline
+          return false
+        end
+
+        values[key] = [value, cas]
+        true
+      end
+
+      def unexpected_reply_key?(key)
+        !key.nil? && @expected_reply_keys && !@expected_reply_keys.include?(reply_key_form(key))
+      end
+
+      # Keys compared as bytes; ASCII keys compare equal in any encoding as is
+      def reply_key_form(key)
+        key.ascii_only? ? key : key.b
+      end
+
+      # Drops the rest of this server's replies and closes the connection so
+      # nothing unread is left on it. Not a socket failure, so it doesn't count
+      # toward socket_max_failures; the keys not read are simply missing.
+      def abandon_pipeline
+        Dalli.logger.warn { "#{name} replied to a get_multi with a key that wasn't requested; closing the connection" }
+        response_buffer.clear
+        @connection_manager.close
       end
 
       # Called after the noop response is received at the end of a set
