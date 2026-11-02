@@ -95,7 +95,7 @@ module Dalli
           res = unpack_response_body(resp_header, body, !raw)
 
           if key != res.first
-            raise Dalli::SocketCorruptionError, "Socket corruption detected - key does not match response"
+            raise Dalli::SocketCorruptionError, 'Socket corruption detected - key does not match response'
           end
 
           res
