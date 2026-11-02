@@ -4,6 +4,32 @@ Dalli Changelog
 Unreleased
 ==========
 
+3.2.15
+==========
+
+- Keep a connection shared by several threads or fibers in step during a `quiet` block (GHSA-5xvx-r8rg-5qm2)
+  - A `quiet` (or `multi`) block is quiet only for the thread or fiber that runs it. memcached still replies to a quiet request that fails (for example an `add` of a key that exists), and another thread or fiber using the same client while the block was open read that reply as its own, so its later requests could return another key's value. A non-quiet request now reads any pending quiet replies first
+  - Affects every supported line, with both protocols; with the binary protocol the connection stayed out of step after the block ended. Fixed in 5.2.4, 5.1.6, 5.0.12, 4.3.9 and 3.2.15
+- With `protocol: :meta`, read values by their size instead of up to the first CRLF (GHSA-5xvx-r8rg-5qm2)
+  - `get`, `gat` and `cas` read a value as one line, so a value containing CR/LF was cut short and the rest was parsed as the next reply. A stored value containing a crafted reply was then returned for a later read of a different key, with flags that could cause it to be deserialized
+  - Affects 3.2.0 to 3.2.14 with `protocol: :meta`; fixed in 3.2.15. The binary protocol (3.2's default) and 4.0 and later aren't affected
+- A per-request `raw: true` write no longer compresses the value (backport of #1213)
+  - Values at or above the compression threshold (4 KB by default) were compressed and flagged even with `raw: true`. Raw reads ignore flags, so reading them back with `raw: true` returned the compressed bytes
+  - Raw values are now stored exactly as given. Callers that pass `raw: true` without `compress: false` store large values uncompressed; Rails' `MemCacheStore` passes `compress: false` and isn't affected
+- Handle failed TLS handshakes like other connection failures, and warn when TLS verification is off (backport of #1215)
+  - A failed or timed-out handshake left the TCP socket open until GC and raised `OpenSSL::SSL::SSLError` directly, so the server was never marked down. The socket is now closed, and the error goes through the usual retry and `socket_max_failures` handling, raising `Dalli::NetworkError` (or `Dalli::RingError` once no server is available)
+  - Certificate and hostname checks come only from the `ssl_context` you pass, and a bare `OpenSSL::SSL::SSLContext.new` checks neither. Dalli now logs a warning once per process when `verify_mode` doesn't include `VERIFY_PEER` or `verify_hostname` is false; see the new TLS section in the README
+- A reply line longer than 8 KiB without a CRLF, or one cut short by the connection closing, is now a network error that closes the connection. Before, the line had no length limit (backport of #1216)
+
+3.2.14
+==========
+
+- Don't rely on memcached's auto-create for keys that need base64 encoding (GHSA-r47x-6p6r-mvcp)
+  - memcached stores an item made by auto-create (`ma` with `N`/`J`, or `mg` with `N`) for a base64-encoded key without its binary-key flag, and later replies name the item by its raw key bytes. A key containing spaces or CR/LF could then make a multi-get read the replies after it as different ones
+  - `incr` and `decr` with an initial value now create such counters with an add instead. Return values are unchanged
+  - The new `verify_reply_keys` option makes `get_multi` ignore replies for keys they didn't request, which guards against items created by older Dalli versions or other clients until memcached is upgraded. It's off by default, since it costs a multi-get about 15%
+  - Affects `protocol: :meta` since 3.2.0; fixed in 5.2.3, 5.1.5, 5.0.11, 4.3.8 and 3.2.14. memcached 1.6.45 and earlier still name these items by their raw key bytes
+
 3.2.13
 ==========
 
