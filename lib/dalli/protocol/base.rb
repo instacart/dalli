@@ -26,6 +26,7 @@ module Dalli
         warn_uri_credentials(user_creds)
         @options = client_options.merge(user_creds)
         @raw_mode = client_options[:raw]
+        @verify_reply_keys = client_options[:verify_reply_keys] ? true : false
         @value_marshaller = @raw_mode ? StringMarshaller.new(@options) : ValueMarshaller.new(@options)
         @connection_manager = ConnectionManager.new(hostname, port, socket_type, @options)
       end
@@ -51,15 +52,25 @@ module Dalli
         begin
           request_completed = false
           @connection_manager.start_request!
+          drain_pending_quiet_responses(opkey)
           response = send(opkey, *args)
+          # Quiet requests can leave replies on the socket; remember that so a
+          # later non-quiet request knows to read them first
+          @connection_manager.mark_quiet_responses_pending! if quiet? && opkey != :noop
 
           # pipelined_get/pipelined_get_interleaved emit query but don't read the response(s)
           @connection_manager.finish_request! unless %i[pipelined_get pipelined_get_interleaved].include?(opkey)
 
           request_completed = true
           response
-        rescue Dalli::MarshalError => e
-          log_marshal_err(args.first, e)
+        rescue Dalli::MarshalError, Dalli::ValueOverMaxSize => e
+          log_marshal_err(args.first, e) if e.is_a?(Dalli::MarshalError)
+          # Raised only while the connection is clean: a value is marshalled
+          # before any of its request is written, and write_multi_req raises
+          # only after reading every reply. Closing the connection would
+          # discard earlier quiet writes still waiting in the write buffer.
+          @connection_manager.abort_request!
+          request_completed = true
           raise
         rescue Dalli::DalliError
           raise
@@ -106,7 +117,7 @@ module Dalli
         verify_pipelined_state(:getkq)
         write_noop
         # Use ensure_ready instead of reset to preserve any data already buffered
-        # during interleaved pipelined get draining
+        # while this get_multi's interleaved requests were sent
         response_buffer.ensure_ready
       end
 
@@ -119,6 +130,8 @@ module Dalli
       # avoiding intermediate Hash allocation. Returns nil.
       # Without a block, returns a Hash of { key => [value, cas] }.
       def pipeline_next_responses(&block)
+        return abandon_pipeline if @pipeline_out_of_step
+
         reconnect_on_pipeline_complete!
         values = nil
 
@@ -140,6 +153,13 @@ module Dalli
           # to the noop at the end of the pipeline
           finish_pipeline && break if status && key.nil?
 
+          # A key that wasn't requested means the replies are out of step
+          # (see expect_reply_keys): keep what was read so far, drop the rest
+          if unexpected_reply_key?(key)
+            abandon_pipeline
+            break
+          end
+
           # If the status is ok and the key is not nil, then this is a
           # getkq response with a value that we want to set in the response hash
           unless key.nil?
@@ -151,6 +171,10 @@ module Dalli
             end
           end
 
+          # A request to this server from inside the block closes the
+          # connection, and with it the rest of this get_multi's replies
+          raise_pipeline_closed unless response_buffer.in_progress?
+
           # Get the next response from the buffer
           status, cas, key, value = response_buffer.process_single_getk_response
         end
@@ -160,21 +184,24 @@ module Dalli
       # rubocop:enable Metrics/AbcSize, Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
 
       # Abort current pipelined get. Generally used to signal an external
-      # timeout during pipelined get.  The underlying socket is
+      # timeout during pipelined get, or that the get_multi stopped before
+      # reading all its replies (timed_out: false).  The underlying socket is
       # disconnected, and the exception is swallowed.
       #
       # Returns nothing.
-      def pipeline_abort
+      def pipeline_abort(timed_out: true)
         response_buffer.clear
+        @pipeline_out_of_step = false
+        @expected_reply_keys = nil
         @connection_manager.abort_request!
         return true unless connected?
 
         # Closes the connection, which ensures that our connection is in a
         # clean state for future requests. The get_multi ran out of time
-        # overall rather than hitting a socket error, so it doesn't count
-        # toward socket_max_failures: two slow get_multis in a row would
-        # otherwise mark a healthy server down.
-        Dalli.logger.warn { "#{name} didn't finish a get_multi within socket_timeout; closing the connection" }
+        # overall, or stopped early, rather than hitting a socket error, so it
+        # doesn't count toward socket_max_failures: two slow get_multis in a
+        # row would otherwise mark a healthy server down.
+        log_pipeline_abort(timed_out)
         @connection_manager.close
         true
       end
@@ -205,6 +232,18 @@ module Dalli
 
       ALLOWED_QUIET_OPS = %i[add replace set delete incr decr append prepend flush noop].freeze
       private_constant :ALLOWED_QUIET_OPS
+
+      # Reads the replies still pending from quiet requests before any
+      # non-quiet request, which reads a reply of its own. A quiet block reads
+      # them at its end, but the connection is shared: another thread or fiber
+      # (quiet? is fiber-local) can make a request while the block is still
+      # open, and would otherwise read the block's replies as its own. The
+      # noop also sends any quiet requests still buffered.
+      def drain_pending_quiet_responses(opkey)
+        return unless @connection_manager.quiet_responses_pending? && opkey != :noop && !quiet?
+
+        noop
+      end
 
       def verify_allowed_quiet!(opkey)
         return if ALLOWED_QUIET_OPS.include?(opkey)
@@ -266,6 +305,7 @@ module Dalli
         # Use clear (not reset) to keep pipeline_complete? = true, which is
         # the expected state before pipeline_response_setup is called.
         response_buffer.clear
+        expect_reply_keys(keys)
 
         req = +''
         keys.each do |key|
@@ -279,8 +319,10 @@ module Dalli
       # This prevents socket buffer deadlock when sending many keys.
       # Populates the provided results hash with any responses drained during send.
       def pipelined_get_interleaved(keys, chunk_size, results)
-        # Initialize the response buffer for draining during send phase
-        response_buffer.ensure_ready
+        # Start with an empty buffer for draining during the send phase. Bytes
+        # left by an earlier get_multi that stopped early belong to its replies.
+        response_buffer.reset
+        expect_reply_keys(keys)
 
         keys.each_slice(chunk_size) do |chunk|
           # Build and write this chunk of requests
@@ -313,6 +355,12 @@ module Dalli
           status, cas, key, value = response_buffer.process_single_getk_response
           break if status.nil? # No complete response available
 
+          # Handled by the next pipeline_next_responses, once sending is done
+          if unexpected_reply_key?(key)
+            @pipeline_out_of_step = true
+            break
+          end
+
           results[key] = [value, cas] unless key.nil?
         end
       rescue SystemCallError, Dalli::NetworkError
@@ -320,8 +368,48 @@ module Dalli
         nil
       end
 
+      # Registered with the connection manager, which clears it whenever the
+      # connection closes, so a new connection never parses an old one's bytes
       def response_buffer
-        @response_buffer ||= ResponseBuffer.new(@connection_manager, response_processor)
+        @response_buffer ||= ResponseBuffer.new(@connection_manager, response_processor).tap do |buffer|
+          @connection_manager.response_buffer = buffer
+        end
+      end
+
+      # A multi-get only accepts replies for the keys it asked for. memcached
+      # names an item created by auto-create (ma or mg with N) for a
+      # base64-encoded key by its raw bytes, without the b flag; such a key
+      # can contain spaces or CR/LF, which split the reply header and make the
+      # replies after it parse as different ones. A key that wasn't requested
+      # is how that shows up.
+      # Only with the verify_reply_keys option, since building the set costs a
+      # multi-get about 15%. Dalli itself no longer creates such items (see
+      # Meta#decr_incr); the check guards against ones that older versions or
+      # other clients created, on memcached versions with the behavior.
+      def expect_reply_keys(keys)
+        @pipeline_out_of_step = false
+        @expected_reply_keys = (keys.to_set { |k| reply_key_form(k) } if @verify_reply_keys)
+      end
+
+      def unexpected_reply_key?(key)
+        !key.nil? && @expected_reply_keys && !@expected_reply_keys.include?(reply_key_form(key))
+      end
+
+      # Keys compared as bytes; ASCII keys compare equal in any encoding as is
+      def reply_key_form(key)
+        key.ascii_only? ? key : key.b
+      end
+
+      # Keeps what was read, drops the rest of this server's replies, and
+      # closes the connection so nothing unread is left on it. Not a socket
+      # failure, so it doesn't count toward socket_max_failures; the keys not
+      # read are simply missing from the result.
+      def abandon_pipeline
+        Dalli.logger.warn { "#{name} replied to a get_multi with a key that wasn't requested; closing the connection" }
+        @pipeline_out_of_step = false
+        response_buffer.clear
+        @connection_manager.close
+        {}
       end
 
       # Called after the noop response is received at the end of a set
@@ -337,7 +425,23 @@ module Dalli
         @connection_manager.reconnect! 'pipelined get has completed' if pipeline_complete?
       end
 
+      def raise_pipeline_closed
+        raise Dalli::DalliError, "The connection to #{name} closed while a get_multi was reading its replies " \
+                                 '(a request made from inside the get_multi block?)'
+      end
+
+      def log_pipeline_abort(timed_out)
+        if timed_out
+          Dalli.logger.warn { "#{name} didn't finish a get_multi within socket_timeout; closing the connection" }
+        else
+          Dalli.logger.debug { "#{name} get_multi stopped before reading all replies; closing the connection" }
+        end
+      end
+
+      # The single-server set_multi path passes its whole pairs hash as the
+      # first argument; log only its keys, never the values
       def log_marshal_err(key, err)
+        key = key.keys.join("', '") if key.is_a?(Hash)
         Dalli.logger.error "Marshalling error for key '#{key}': #{err.message}"
         Dalli.logger.error 'You are trying to cache a Ruby object which cannot be serialized to memcached.'
       end

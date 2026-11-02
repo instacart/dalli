@@ -60,7 +60,9 @@ module Dalli
           return [key, true] unless tokens.first == VA
 
           response_key = key_from_tokens(tokens)
-          if key != response_key
+          # Compare bytes: a non-ASCII request key is sent as binary, but the
+          # decoded response key may carry a different encoding tag.
+          if key.b != response_key.to_s.b
             raise Dalli::SocketCorruptionError, 'Socket corruption detected - key does not match response'
           end
 
