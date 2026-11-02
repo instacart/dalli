@@ -65,7 +65,7 @@ module Dalli
       @options = normalize_options(options)
 
       if !@options[:protocol].nil? && @options[:protocol] != :binary
-        raise NotImplementedError, "This fork does not support the #{@options[:protocol]} protocol because safe_get is not implemented"
+        raise NotImplementedError, "This fork does not support the #{@options[:protocol]} protocol (no safe_get)"
       end
 
       @key_manager = ::Dalli::KeyManager.new(@options)
