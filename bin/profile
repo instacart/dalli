@@ -41,7 +41,16 @@ TERMINATOR = "\r\n"
 puts "yjit: #{RubyVM::YJIT.enabled?}"
 
 client = Dalli::Client.new(dalli_url, serializer: NoopSerializer, compress: false)
-meta_client = Dalli::Client.new(dalli_url, protocol: :meta, serializer: NoopSerializer, compress: false, raw: true)
+# This fork does not implement the meta protocol, so meta profiles are skipped when it is unavailable.
+meta_client = begin
+  Dalli::Client.new(dalli_url, protocol: :meta, serializer: NoopSerializer, compress: false, raw: true)
+rescue NotImplementedError
+  nil
+end
+
+def profile_meta(meta_client, out, &)
+  Vernier.profile(out: out, &) if meta_client
+end
 
 # The raw socket implementation is used to benchmark the performance of dalli & the overhead of the various abstractions
 # in the library.
@@ -57,7 +66,7 @@ payload = 'B' * bench_payload_size
 dalli_key = 'dalli_key'
 # ensure the clients are all connected and working
 client.set(dalli_key, payload)
-meta_client.set(dalli_key, payload)
+meta_client&.set(dalli_key, payload)
 sock.write("set sock_key 0 3600 #{payload.bytesize}\r\n")
 sock.write(payload)
 sock.write(TERMINATOR)
@@ -131,7 +140,7 @@ if %w[all get].include?(bench_target)
     end
   end
 
-  Vernier.profile(out: 'meta_client_get_profile.json') do
+  profile_meta(meta_client, 'meta_client_get_profile.json') do
     start_time = Time.now
     while Time.now - start_time < bench_time
       result = meta_client.get(dalli_key)
@@ -157,7 +166,7 @@ if %w[all set].include?(bench_target)
     client.set(dalli_key, payload, 3600, raw: true) while Time.now - start_time < bench_time
   end
 
-  Vernier.profile(out: 'meta_client_set_profile.json') do
+  profile_meta(meta_client, 'meta_client_set_profile.json') do
     start_time = Time.now
     meta_client.set(dalli_key, payload, 3600, raw: true) while Time.now - start_time < bench_time
   end
@@ -183,7 +192,7 @@ if %w[all get_multi].include?(bench_target)
     end
   end
 
-  Vernier.profile(out: 'meta_client_get_multi_profile.json') do
+  profile_meta(meta_client, 'meta_client_get_multi_profile.json') do
     start_time = Time.now
     while Time.now - start_time < bench_time
       result = meta_client.get_multi(pairs.keys)
@@ -212,7 +221,7 @@ if %w[all set_multi].include?(bench_target)
     end
   end
 
-  Vernier.profile(out: 'meta_client_set_multi_profile.json') do
+  profile_meta(meta_client, 'meta_client_set_multi_profile.json') do
     start_time = Time.now
     while Time.now - start_time < bench_time
       pairs.each do |key, value|

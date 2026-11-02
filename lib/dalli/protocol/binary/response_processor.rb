@@ -94,8 +94,10 @@ module Dalli
 
           res = unpack_response_body(resp_header, body, !raw)
 
-          if key != res.first
-            raise Dalli::SocketCorruptionError, "Socket corruption detected - key does not match response"
+          # Compare bytes: the response key is tagged UTF-8, but a non-ASCII
+          # request key is sent as binary, and Ruby treats those as unequal.
+          if key.b != res.first.to_s.b
+            raise Dalli::SocketCorruptionError, 'Socket corruption detected - key does not match response'
           end
 
           res
