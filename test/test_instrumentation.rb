@@ -454,7 +454,8 @@ describe Dalli::Instrumentation do
 
           span = @mock_tracer.spans.last
 
-          assert_equal 'get', span.attributes['db.operation.name']
+          # This fork's Client#get performs safe_get
+          assert_equal 'safe_get', span.attributes['db.operation.name']
           assert_nil span.attributes['db.operation']
         end
       end
